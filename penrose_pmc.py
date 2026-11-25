@@ -1,0 +1,1174 @@
+"""
+Penrose v1.0 — PMC (Penrose Manifold Cartridge, `.pmc` / `.bkp`)
+================================================================
+基于十条零超参数闭式物理公理的同质微专家黎曼流形块管理引擎。
+"""
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from bkp_manager import (
+    D_BKP,
+    PAGE_SIZE,
+    BKP_NUM_HEADS,
+    BKP_HEAD_DIM,
+    BKP_SUBKEY_DIM,
+    STANDARD_GRID_SIZES,
+    EULER_MASCHERONI,
+    GUMBEL_STD_COEFF,
+    SIMPLEX_2_GEODESIC_PROJ,
+    SIMPLEX_3_BARYCENTER_PROJ,
+    JET_NORMAL_ALPHA_STAR,
+    JET_TANGENT_NORM_STAR,
+    closed_form_gumbel_threshold,
+    round_up_to_standard_grid,
+    BKPMountMode as PMCMountMode,
+    BKPRoutingConfig as PMCRoutingConfig,
+    BKPPackage,
+    BKPManager,
+)
+
+PMC_MAGIC: bytes = b"PMC2048\x00"
+
+
+@dataclass
+class HelmholtzFieldDiagnostics:
+    """
+    PMC 流形场在当前球面状态 q(tau) 处的实时微分几何诊断量（驱动 Module 5 三态总线分支）：
+    - delta_pmc       : (B, T, 2048) 流形场合成切向推力 V_PMC(q)
+    - div_v           : (B, T) 局部散度 Tr(J_local) = sum_m w_m <u_m, v_m>
+    - eta_curl        : (B, T) 局部归一化旋度能量比 in [0, 1]
+    - active_experts  : (B, T, K_active) 当前步唤醒的微专家全局页索引
+    - active_weights  : (B, T, K_active) 对应的 L2 守恒路由权重 w_m(q)
+    - max_resonance   : (B, T) 最大微专家共振内积峰值
+    """
+    delta_pmc: torch.Tensor
+    div_v: torch.Tensor
+    eta_curl: torch.Tensor
+    active_experts: torch.Tensor
+    active_weights: torch.Tensor
+    max_resonance: torch.Tensor
+
+
+class PMCPackage(BKPPackage):
+    """
+    Penrose Manifold Cartridge (`.pmc`) 四叉树流形块实体。
+    100% 继承 BKPPackage 的 4KB 同质微专家页 `(u_m, v_m)` 与十条闭式公理算子，
+    并扩展静态流线指针表 `stream_next_ptr` 与无 AdamW 罗德里格斯大圆旋转写入。
+    """
+
+    def __init__(
+        self,
+        pkg_id: str,
+        grid_k: int = 64,
+        mount_mode: PMCMountMode = PMCMountMode.RW_SHARED,
+        is_base_pkg: bool = False,
+        mmap_file_path: Optional[str] = None,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__(
+            pkg_id=pkg_id,
+            grid_k=grid_k,
+            mount_mode=mount_mode,
+            is_base_pkg=is_base_pkg,
+            mmap_file_path=mmap_file_path,
+            device=device,
+        )
+        self.register_buffer(
+            "stream_next_ptr",
+            torch.full((self.num_experts, 4), -1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self._needs_quadrant_expand: bool = False
+
+    def _rebuild_runtime_buffers_after_topology_change(self) -> None:
+        super()._rebuild_runtime_buffers_after_topology_change()
+        dev = self.scales.device
+        if not hasattr(self, "stream_next_ptr") or self.stream_next_ptr.shape[0] != self.num_experts:
+            self.register_buffer(
+                "stream_next_ptr",
+                torch.full((self.num_experts, 4), -1, dtype=torch.int32, device=dev),
+                persistent=False,
+            )
+
+    @staticmethod
+    def _remap_stream_table(
+        old_ptr: torch.Tensor,
+        old_to_new_eid: torch.Tensor,
+        new_num_experts: int,
+        src_eids: Optional[torch.Tensor] = None,
+        dst_eids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        dev = old_ptr.device
+        new_ptr = torch.full((new_num_experts, 4), -1, dtype=torch.int32, device=dev)
+        if src_eids is None:
+            src_eids = torch.arange(old_ptr.size(0), device=dev, dtype=torch.long)
+        if dst_eids is None:
+            dst_eids = old_to_new_eid[src_eids]
+        valid_rows = (dst_eids >= 0) & (dst_eids < new_num_experts)
+        src_v = src_eids[valid_rows]
+        dst_v = dst_eids[valid_rows]
+        sub_ptr = old_ptr[src_v].long()
+        valid_t = (sub_ptr >= 0) & (sub_ptr < old_to_new_eid.numel())
+        mapped = torch.full_like(sub_ptr, -1)
+        if bool(valid_t.any()):
+            mapped[valid_t] = old_to_new_eid[sub_ptr[valid_t]]
+        new_ptr[dst_v] = mapped.to(torch.int32)
+        return new_ptr
+
+    @torch.no_grad()
+    def expand_quadrant_2x(self, perturb_scale: float = 0.05) -> None:
+        old_k = self.grid_k
+        new_k = old_k * 2
+        dev = self.scales.device
+        old_ptr = self.stream_next_ptr.clone()
+        old_eids = torch.arange(old_k * old_k, device=dev, dtype=torch.long)
+        r_old = torch.div(old_eids, old_k, rounding_mode="floor")
+        c_old = old_eids % old_k
+        old_to_new = r_old * new_k + c_old
+
+        super().expand_quadrant_2x(perturb_scale=perturb_scale)
+        self.stream_next_ptr.copy_(
+            self._remap_stream_table(old_ptr, old_to_new, new_k * new_k, src_eids=old_eids, dst_eids=old_to_new)
+        )
+        self._needs_quadrant_expand = False
+
+    @torch.no_grad()
+    def permute_rows_cols(self, row_perm: torch.Tensor, col_perm: torch.Tensor) -> None:
+        k = self.grid_k
+        dev = self.scales.device
+        old_ptr = self.stream_next_ptr.clone()
+        r_dev = row_perm.to(dev).long()
+        c_dev = col_perm.to(dev).long()
+        inv_r = torch.empty_like(r_dev)
+        inv_c = torch.empty_like(c_dev)
+        inv_r[r_dev] = torch.arange(k, device=dev, dtype=torch.long)
+        inv_c[c_dev] = torch.arange(k, device=dev, dtype=torch.long)
+
+        old_eids = torch.arange(k * k, device=dev, dtype=torch.long)
+        r_old = torch.div(old_eids, k, rounding_mode="floor")
+        c_old = old_eids % k
+        old_to_new = inv_r[r_old] * k + inv_c[c_old]
+
+        super().permute_rows_cols(row_perm, col_perm)
+        self.stream_next_ptr.copy_(
+            self._remap_stream_table(old_ptr, old_to_new, k * k, src_eids=old_eids, dst_eids=old_to_new)
+        )
+
+    @torch.no_grad()
+    def extract_padded_subpackage(self, sub_id: str, row_idx: torch.Tensor, col_idx: torch.Tensor) -> "PMCPackage":
+        base_sub = super().extract_padded_subpackage(sub_id, row_idx, col_idx)
+        dev = self.u_codebook.device
+        pmc_sub = PMCPackage(
+            pkg_id=base_sub.pkg_id,
+            grid_k=base_sub.grid_k,
+            mount_mode=base_sub.mount_mode,
+            is_base_pkg=base_sub.is_base_pkg,
+            device=dev,
+        )
+        pmc_sub._copy_manifold_stats_from(base_sub)
+        pmc_sub.codebook_pre_centered.copy_(base_sub.codebook_pre_centered)
+        pmc_sub._codebook_pre_centered_cached = base_sub._codebook_pre_centered_cached
+        pmc_sub.u_codebook.data.copy_(base_sub.u_codebook.data)
+        pmc_sub.v_codebook.data.copy_(base_sub.v_codebook.data)
+        pmc_sub.expert_pages_int8.copy_(base_sub.expert_pages_int8)
+        pmc_sub.scales.copy_(base_sub.scales)
+        pmc_sub.activation_counts.copy_(base_sub.activation_counts)
+        pmc_sub.purity_r.copy_(base_sub.purity_r)
+        pmc_sub._rebuild_runtime_buffers_after_topology_change()
+
+        k_old = self.grid_k
+        k_new = pmc_sub.grid_k
+        r_dev = row_idx.to(dev).long()
+        c_dev = col_idx.to(dev).long()
+        inv_r = torch.full((k_old,), -1, dtype=torch.long, device=dev)
+        inv_c = torch.full((k_old,), -1, dtype=torch.long, device=dev)
+        inv_r[r_dev] = torch.arange(r_dev.numel(), device=dev, dtype=torch.long)
+        inv_c[c_dev] = torch.arange(c_dev.numel(), device=dev, dtype=torch.long)
+
+        old_eids = torch.arange(k_old * k_old, device=dev, dtype=torch.long)
+        ro = torch.div(old_eids, k_old, rounding_mode="floor")
+        co = old_eids % k_old
+        rn = inv_r[ro]
+        cn = inv_c[co]
+        old_to_new = torch.where((rn >= 0) & (cn >= 0), rn * k_new + cn, torch.full_like(old_eids, -1))
+        pmc_sub.stream_next_ptr.copy_(
+            self._remap_stream_table(self.stream_next_ptr, old_to_new, k_new * k_new)
+        )
+        return pmc_sub
+
+    @staticmethod
+    @torch.no_grad()
+    def bkp_merge_direct_sum(pkg_a: BKPPackage, pkg_b: BKPPackage, merged_id: str) -> "PMCPackage":
+        base_merged = BKPPackage.bkp_merge_direct_sum(pkg_a, pkg_b, merged_id=merged_id)
+        dev = base_merged.u_codebook.device
+        pmc_merged = PMCPackage(
+            pkg_id=base_merged.pkg_id,
+            grid_k=base_merged.grid_k,
+            mount_mode=base_merged.mount_mode,
+            is_base_pkg=base_merged.is_base_pkg,
+            device=dev,
+        )
+        pmc_merged._copy_manifold_stats_from(base_merged)
+        pmc_merged.codebook_pre_centered.copy_(base_merged.codebook_pre_centered)
+        pmc_merged._codebook_pre_centered_cached = base_merged._codebook_pre_centered_cached
+        pmc_merged.u_codebook.data.copy_(base_merged.u_codebook.data)
+        pmc_merged.v_codebook.data.copy_(base_merged.v_codebook.data)
+        pmc_merged.expert_pages_int8.copy_(base_merged.expert_pages_int8)
+        pmc_merged.scales.copy_(base_merged.scales)
+        pmc_merged.activation_counts.copy_(base_merged.activation_counts)
+        pmc_merged.purity_r.copy_(base_merged.purity_r)
+        pmc_merged._rebuild_runtime_buffers_after_topology_change()
+
+        km = pmc_merged.grid_k
+        ka, kb = pkg_a.grid_k, pkg_b.grid_k
+        if isinstance(pkg_a, PMCPackage):
+            ea = torch.arange(ka * ka, device=dev, dtype=torch.long)
+            ra = torch.div(ea, ka, rounding_mode="floor")
+            ca = ea % ka
+            map_a = ra * km + ca
+            ptr_a = PMCPackage._remap_stream_table(pkg_a.stream_next_ptr, map_a, km * km, src_eids=ea, dst_eids=map_a)
+            pmc_merged.stream_next_ptr[map_a] = ptr_a[map_a]
+        if isinstance(pkg_b, PMCPackage):
+            eb = torch.arange(kb * kb, device=dev, dtype=torch.long)
+            rb = torch.div(eb, kb, rounding_mode="floor") + ka
+            cb = (eb % kb) + ka
+            map_b = rb * km + cb
+            ptr_b = PMCPackage._remap_stream_table(pkg_b.stream_next_ptr, map_b, km * km, src_eids=eb, dst_eids=map_b)
+            pmc_merged.stream_next_ptr[map_b] = ptr_b[map_b]
+        return pmc_merged
+
+    @staticmethod
+    @torch.no_grad()
+    def bkp_merge_triadic_bundle(pkg_a: BKPPackage, pkg_b: BKPPackage, merged_id: str) -> "PMCPackage":
+        merged = PMCPackage.bkp_merge_direct_sum(pkg_a, pkg_b, merged_id=merged_id)
+        ka, kb = pkg_a.grid_k, pkg_b.grid_k
+        k_min = min(ka, kb)
+        dev = merged.scales.device
+        idx_common = torch.arange(k_min, device=dev)
+        eids_a = idx_common * merged.grid_k + idx_common
+        eids_b = (ka + idx_common) * merged.grid_k + (ka + idx_common)
+
+        pages_cpu = merged.expert_pages_int8.float()
+        scales_cpu = merged.scales.float().cpu()
+        eids_a_cpu, eids_b_cpu = eids_a.cpu(), eids_b.cpu()
+
+        ua_cur = (pages_cpu[eids_a_cpu, 0, :] * scales_cpu[eids_a_cpu, 0:1]).to(dev)
+        va_cur = (pages_cpu[eids_a_cpu, 1, :] * scales_cpu[eids_a_cpu, 1:2]).to(dev)
+        ub_cur = (pages_cpu[eids_b_cpu, 0, :] * scales_cpu[eids_b_cpu, 0:1]).to(dev)
+        vb_cur = (pages_cpu[eids_b_cpu, 1, :] * scales_cpu[eids_b_cpu, 1:2]).to(dev)
+
+        v_even = 0.5 * (va_cur + vb_cur)
+        v_odd = 0.5 * (va_cur - vb_cur)
+        va_triadic = v_even + v_odd
+        vb_triadic = v_even - v_odd
+
+        merged.write_experts_to_mmap_pages(eids_a, ua_cur, va_triadic)
+        merged.write_experts_to_mmap_pages(eids_b, ub_cur, vb_triadic)
+        return merged
+
+    @torch.no_grad()
+    def record_streamline_transition(
+        self,
+        curr_eids: torch.Tensor,
+        next_eids: torch.Tensor,
+    ) -> None:
+        if curr_eids.numel() == 0 or next_eids.numel() == 0:
+            return
+        c_flat = curr_eids.reshape(-1).to(torch.long)
+        n_flat = next_eids.reshape(-1).to(torch.int32)
+        valid = (c_flat >= 0) & (c_flat < self.num_experts) & (n_flat >= 0) & (n_flat < self.num_experts)
+        if not bool(valid.any()):
+            return
+        c_valid = c_flat[valid]
+        n_valid = n_flat[valid]
+        cur_slots = self.stream_next_ptr[c_valid]
+        already_in = (cur_slots == n_valid.unsqueeze(-1)).any(dim=-1)
+        update_mask = ~already_in
+        if bool(update_mask.any()):
+            idx_u = c_valid[update_mask]
+            val_u = n_valid[update_mask]
+            shifted = torch.empty_like(self.stream_next_ptr[idx_u])
+            shifted[:, 0] = val_u
+            shifted[:, 1:] = self.stream_next_ptr[idx_u, :-1]
+            self.stream_next_ptr[idx_u] = shifted
+
+    @torch.no_grad()
+    def quantize_write_expert_page(
+        self,
+        eid: int,
+        u_vec: torch.Tensor,
+        v_vec: torch.Tensor,
+        hit_increment: float = 1.0,
+        purity_val: float = 1.0,
+    ) -> None:
+        dev = self.scales.device
+        eid_t = torch.tensor([int(eid)], dtype=torch.long, device=dev)
+        u_f = F.normalize(u_vec.detach().to(device=dev, dtype=torch.float32).view(1, D_BKP), dim=-1) * math.sqrt(float(D_BKP))
+        v_f = v_vec.detach().to(device=dev, dtype=torch.float32).view(1, D_BKP)
+        self.write_experts_to_mmap_pages(eid_t, u_f, v_f)
+        self.activation_counts[eid] = self.activation_counts[eid] + int(max(1.0, round(hit_increment)))
+        self.purity_r[eid] = float(max(0.0, min(1.0, purity_val)))
+
+    @torch.no_grad()
+    def dequantize_expert_uv(self, eids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if eids.dim() == 0:
+            u_out, v_out = self.read_experts_from_mmap_pages(eids.view(1))
+            return u_out.squeeze(0), v_out.squeeze(0)
+        return self.read_experts_from_mmap_pages(eids)
+
+    @staticmethod
+    @torch.no_grad()
+    def rodrigues_geodesic_rotation(
+        u_curr: torch.Tensor,
+        q_target: torch.Tensor,
+        step_fraction: float = 1.0,
+    ) -> torch.Tensor:
+        u_unit = F.normalize(u_curr.float(), dim=-1)
+        q_unit = F.normalize(q_target.float(), dim=-1)
+        cos_theta = (u_unit * q_unit).sum(dim=-1, keepdim=True).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        theta = torch.acos(cos_theta) * float(step_fraction)
+        w_perp = F.normalize(q_unit - cos_theta * u_unit, dim=-1)
+        u_rot = torch.cos(theta) * u_unit + torch.sin(theta) * w_perp
+        return F.normalize(u_rot, dim=-1)
+
+
+class PMCManager(BKPManager):
+    """
+    Penrose Manifold Cartridge (`.pmc`) 流形块森林管理器。
+    """
+
+    def __init__(
+        self,
+        routing_cfg: Optional[PMCRoutingConfig] = None,
+        cache_slots: int = 131072,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__(config=routing_cfg, cache_slots=cache_slots, device=device)
+        self.prefetch_queue_eids: List[Tuple[str, torch.Tensor]] = []
+        self.total_kaczmarz_snaps: int = 0
+        self.total_mitosis_spawns: int = 0
+        self.split_count: int = 0
+        self.expand_count: int = 0
+        self.merge_count: int = 0
+        self.spawn_count: int = 0
+        self.closure_count: int = 0
+        self.forest_events: List[Dict[str, Any]] = []
+
+    @torch.no_grad()
+    def _record_manifold_telemetry(
+        self,
+        q_flat: torch.Tensor,
+        pkg_hit_masks: Dict[str, torch.Tensor],
+        global_max_res: torch.Tensor,
+    ) -> None:
+        N = q_flat.size(0)
+        self._total_periodic_queries = getattr(self, "_total_periodic_queries", 0) + N
+
+        active_pids = [pid for pid, m in pkg_hit_masks.items() if bool(m.any())]
+        for pid in active_pids:
+            cnt = float(pkg_hit_masks[pid].float().sum().item())
+            self.pkg_token_hit_counts[pid] = self.pkg_token_hit_counts.get(pid, 0.0) + cnt
+        if len(active_pids) >= 2:
+            for idx_a in range(len(active_pids)):
+                for idx_b in range(idx_a + 1, len(active_pids)):
+                    pa, pb = active_pids[idx_a], active_pids[idx_b]
+                    key = (pa, pb) if pa < pb else (pb, pa)
+                    co_hits = float((pkg_hit_masks[pa] & pkg_hit_masks[pb]).float().sum().item())
+                    if co_hits > 0:
+                        self.pkg_coactivation_counts[key] = self.pkg_coactivation_counts.get(key, 0.0) + co_hits
+
+        tau_desert = SIMPLEX_3_BARYCENTER_PROJ * 0.65
+        low_mask = global_max_res < tau_desert
+        n_low = int(low_mask.sum().item())
+        if n_low > 0:
+            self._low_hit_periodic_queries = getattr(self, "_low_hit_periodic_queries", 0) + n_low
+            q_low = F.normalize(q_flat[low_mask].detach().float(), dim=-1).view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM)
+            q1_low = q_low[:, :, 0, :]
+            q2_low = q_low[:, :, 1, :]
+            if self._low_hit_q1_reservoir is None or self._low_hit_q2_reservoir is None:
+                self._low_hit_q1_reservoir = q1_low[:256]
+                self._low_hit_q2_reservoir = q2_low[:256]
+            else:
+                self._low_hit_q1_reservoir = torch.cat([self._low_hit_q1_reservoir.to(q1_low.device), q1_low], dim=0)[-256:]
+                self._low_hit_q2_reservoir = torch.cat([self._low_hit_q2_reservoir.to(q2_low.device), q2_low], dim=0)[-256:]
+
+    @property
+    def mounted_packages(self) -> List[BKPPackage]:
+        return list(self.packages.values())
+
+    def get_writable_package(self) -> Optional[PMCPackage]:
+        for pkg in reversed(self.mounted_packages):
+            if pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE):
+                if isinstance(pkg, PMCPackage):
+                    return pkg
+        for pkg in self.mounted_packages:
+            if isinstance(pkg, PMCPackage):
+                return pkg
+        return None
+
+    @torch.no_grad()
+    def prefetch_along_geodesic_streamline(
+        self,
+        psi_0: torch.Tensor,
+        top_m: int = 8,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        self.prefetch_queue_eids.clear()
+        if len(self.mounted_packages) == 0:
+            return self.prefetch_queue_eids
+
+        q_flat = psi_0.detach().float().reshape(-1, D_BKP)
+        q_probe = q_flat[: min(16, q_flat.size(0))]
+        q_heads = F.normalize(q_probe.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+
+        for pkg in self.mounted_packages:
+            u_cb = F.normalize(pkg.u_codebook.detach().float(), dim=-1)
+            v_cb = F.normalize(pkg.v_codebook.detach().float(), dim=-1)
+            su = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 0, :], u_cb)
+            sv = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 1, :], v_cb)
+            top_u = su.amax(dim=1).topk(min(top_m, pkg.grid_k), dim=-1).indices
+            top_v = sv.amax(dim=1).topk(min(top_m, pkg.grid_k), dim=-1).indices
+            eids_curr = (top_u * pkg.grid_k + top_v).reshape(-1).unique()
+
+            if isinstance(pkg, PMCPackage):
+                next_ptrs = pkg.stream_next_ptr[eids_curr].reshape(-1)
+                valid_next = next_ptrs[next_ptrs >= 0].to(eids_curr.dtype)
+                if valid_next.numel() > 0:
+                    eids_curr = torch.cat([eids_curr, valid_next]).unique()
+
+        self.prefetch_queue_eids.append((pkg.pkg_id, eids_curr))
+        return self.prefetch_queue_eids
+
+    @torch.no_grad()
+    def _select_candidate_grid_subset(
+        self,
+        pkg: BKPPackage,
+        q_heads: torch.Tensor,
+        sub_top_m: int = 8,
+        puncture_expert_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        白皮书两级笛卡尔乘积码本 O(K_p) 候选子集筛选器：
+        利用 u_codebook 与 v_codebook 先筛出当前批次在网格 K_p x K_p 上的高共振候选行与候选列，
+        仅返回筛出的非空微专家页号子集 cand_eids: (M_cand,)，彻底杜绝全表扫描！
+        """
+        k_p = pkg.grid_k
+        dev = q_heads.device
+        sv_1d = pkg.scales[:, 1]
+        active_1d = sv_1d > 0
+        if puncture_expert_mask is not None and puncture_expert_mask.numel() == pkg.num_experts:
+            active_1d = active_1d & (~puncture_expert_mask.to(active_1d.device))
+        if not bool(active_1d.any()):
+            return torch.empty(0, dtype=torch.long, device=dev)
+
+        active_2d = active_1d.view(k_p, k_p)
+        valid_r = active_2d.any(dim=1)  # (K_p,)
+        valid_c = active_2d.any(dim=0)  # (K_p,)
+
+        u_cb = F.normalize(pkg.u_codebook.detach().float(), dim=-1)  # (8, K_p, 128)
+        v_cb = F.normalize(pkg.v_codebook.detach().float(), dim=-1)  # (8, K_p, 128)
+        su = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 0, :], u_cb).mean(dim=1)  # (N, K_p)
+        sv = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 1, :], v_cb).mean(dim=1)  # (N, K_p)
+
+        su = su.masked_fill(~valid_r.unsqueeze(0), -1e9)
+        sv = sv.masked_fill(~valid_c.unsqueeze(0), -1e9)
+
+        m_r = min(sub_top_m, int(valid_r.sum()))
+        m_c = min(sub_top_m, int(valid_c.sum()))
+        top_r = su.topk(max(1, m_r), dim=-1).indices  # (N, m_r)
+        top_c = sv.topk(max(1, m_c), dim=-1).indices  # (N, m_c)
+
+        cand_grid = (top_r.unsqueeze(-1) * k_p + top_c.unsqueeze(-2)).reshape(-1)
+        cand_rows_unique = top_r.reshape(-1).unique()
+        row_eids = torch.nonzero(active_2d[cand_rows_unique], as_tuple=False)
+        if row_eids.numel() > 0:
+            companion_eids = cand_rows_unique[row_eids[:, 0]] * k_p + row_eids[:, 1]
+            cand_all = torch.cat([cand_grid, companion_eids], dim=0).unique()
+        else:
+            cand_all = cand_grid.unique()
+
+        return cand_all[active_1d[cand_all]]
+
+    def query_with_helmholtz_diagnostics(
+        self,
+        q_in: torch.Tensor,
+        puncture_dropout_prob: float = 0.0,
+        puncture_expert_mask: Optional[torch.Tensor] = None,
+    ) -> HelmholtzFieldDiagnostics:
+        orig_shape = q_in.shape
+        B = orig_shape[0]
+        T = orig_shape[1] if len(orig_shape) == 3 else 1
+        q_flat = q_in.reshape(-1, D_BKP)
+        dev = q_flat.device
+
+        if len(self.mounted_packages) == 0:
+            zero_delta = torch.zeros_like(q_in)
+            zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
+            empty_idx = torch.zeros((B, T, 1), device=dev, dtype=torch.long)
+            return HelmholtzFieldDiagnostics(
+                delta_pmc=zero_delta,
+                div_v=zero_scalar,
+                eta_curl=torch.ones_like(zero_scalar),
+                active_experts=empty_idx,
+                active_weights=zero_scalar.unsqueeze(-1),
+                max_resonance=zero_scalar,
+            )
+
+        delta_pmc = self.query_and_inject(q_in)
+
+        with torch.no_grad():
+            pkg = self.mounted_packages[-1]
+            q_unit = F.normalize(q_flat.float(), dim=-1)
+            q_heads = F.normalize(q_unit.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+
+            pkg_hit_masks: Dict[str, torch.Tensor] = {}
+            global_max_res = torch.zeros(q_unit.size(0), device=dev, dtype=torch.float32)
+            for p_iter in self.mounted_packages:
+                cand_p = self._select_candidate_grid_subset(p_iter, q_heads, sub_top_m=8)
+                if cand_p.numel() == 0:
+                    continue
+                if isinstance(p_iter, PMCPackage):
+                    u_p, _ = p_iter.dequantize_expert_uv(cand_p)
+                else:
+                    u_p = p_iter.expert_pages_int8[cand_p.cpu(), 0].float().to(dev) * p_iter.scales[cand_p, 0:1].float()
+                u_p_unit = F.normalize(u_p.to(dev), dim=-1)
+                sim_p = torch.matmul(q_unit, u_p_unit.t())
+                max_p = sim_p.amax(dim=-1)
+                global_max_res = torch.maximum(global_max_res, max_p)
+                pkg_hit_masks[p_iter.pkg_id] = max_p >= SIMPLEX_3_BARYCENTER_PROJ * 0.50
+
+            self._record_manifold_telemetry(q_unit, pkg_hit_masks, global_max_res)
+
+            cand_eids = self._select_candidate_grid_subset(
+                pkg,
+                q_heads,
+                sub_top_m=8,
+                puncture_expert_mask=puncture_expert_mask,
+            )
+            if cand_eids.numel() == 0:
+                zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
+                empty_idx = torch.zeros((B, T, 1), device=dev, dtype=torch.long)
+                return HelmholtzFieldDiagnostics(
+                    delta_pmc=delta_pmc,
+                    div_v=zero_scalar,
+                    eta_curl=torch.ones_like(zero_scalar),
+                    active_experts=empty_idx,
+                    active_weights=zero_scalar.unsqueeze(-1),
+                    max_resonance=zero_scalar,
+                )
+
+            if isinstance(pkg, PMCPackage):
+                u_all, v_all = pkg.dequantize_expert_uv(cand_eids)
+            else:
+                u_all = pkg.expert_pages_int8[cand_eids.cpu(), 0].float().to(dev) * pkg.scales[cand_eids, 0:1].float()
+                v_all = pkg.expert_pages_int8[cand_eids.cpu(), 1].float().to(dev) * pkg.scales[cand_eids, 1:2].float()
+            u_unit = F.normalize(u_all, dim=-1)
+
+            sim = torch.matmul(q_unit, u_unit.t())
+            if puncture_dropout_prob > 0.0:
+                drop_mask = torch.rand_like(sim) < float(puncture_dropout_prob)
+                sim = sim.masked_fill(drop_mask, -1e9)
+
+            k_top = min(8, cand_eids.numel())
+            top_sim, top_rel_idx = torch.topk(sim, k=k_top, dim=-1)
+            top_eids = cand_eids[top_rel_idx]
+            max_res = top_sim[:, 0]
+
+            sim_pos = F.relu(top_sim - SIMPLEX_3_BARYCENTER_PROJ * 0.25)
+            s_max = sim_pos.amax(dim=-1, keepdim=True).clamp_min(1e-6)
+            t_hermite = (sim_pos / s_max).clamp(0.0, 1.0)
+            e_hermite = sim_pos * (t_hermite * t_hermite * (3.0 - 2.0 * t_hermite))
+            w_l2 = F.normalize(e_hermite, p=2.0, dim=-1)
+
+            u_sel = u_unit[top_rel_idx]
+            v_sel = v_all[top_rel_idx]
+
+            res_envelope = top_sim.clamp(0.0, 1.0).pow(2)
+            interp_field = torch.sum((w_l2 * res_envelope).unsqueeze(-1) * v_sel, dim=1).view(orig_shape)
+            if puncture_expert_mask is not None or puncture_dropout_prob > 0.0:
+                delta_pmc = interp_field.to(q_in.dtype)
+            else:
+                # 零 .item() 同步阻塞：纯张量掩码融合 query_and_inject 与局部单纯形插值场
+                is_zero_inject = delta_pmc.abs().amax(dim=-1, keepdim=True) <= 1e-6
+                blended = (0.5 * delta_pmc.float() + 0.5 * interp_field).to(q_in.dtype)
+                delta_pmc = torch.where(is_zero_inject, interp_field.to(q_in.dtype), blended)
+
+            uv_dot = (u_sel * v_sel).sum(dim=-1)
+            v_norm = v_sel.norm(dim=-1).clamp_min(1e-6)
+            cos_uv = (uv_dot / v_norm).clamp(-1.0, 1.0)
+            div_local = (w_l2 * res_envelope * uv_dot).sum(dim=-1)
+            eta_div_local = ((w_l2 * w_l2) * (cos_uv * cos_uv)).sum(dim=-1).clamp(0.0, 1.0)
+            eta_curl_local = 1.0 - eta_div_local
+
+        return HelmholtzFieldDiagnostics(
+            delta_pmc=delta_pmc,
+            div_v=div_local.view(B, T),
+            eta_curl=eta_curl_local.view(B, T),
+            active_experts=top_eids.view(B, T, k_top),
+            active_weights=w_l2.view(B, T, k_top),
+            max_resonance=max_res.view(B, T),
+        )
+
+    @torch.no_grad()
+    def geodesic_kaczmarz_snap_update(
+        self,
+        q_curr: torch.Tensor,
+        q_prev: torch.Tensor,
+        q_target: torch.Tensor,
+        snap_rate: float = 1.0,
+        enable_auto_mitosis: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Penrose v1.0 核心创新：彻底废除 AdamW 的「Kaczmarz 单纯形正交投影 + 罗德里格斯大圆旋转」一步闭式更新器。
+        """
+        pkg = self.get_writable_package()
+        if pkg is None:
+            return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0}
+
+        q_c = F.normalize(q_curr.detach().float().reshape(-1, D_BKP), dim=-1)
+        q_p = F.normalize(q_prev.detach().float().reshape(-1, D_BKP), dim=-1)
+        q_t = F.normalize(q_target.detach().float().reshape(-1, D_BKP), dim=-1)
+        N = q_c.size(0)
+
+        dq = q_c - (q_c * q_p).sum(dim=-1, keepdim=True) * q_c
+        dq_norm = dq.norm(dim=-1, keepdim=True)
+        has_tangent = (dq_norm > 1e-5).float()
+        dq_unit = F.normalize(dq, dim=-1)
+        psi = F.normalize(
+            JET_NORMAL_ALPHA_STAR * q_c
+            + has_tangent * JET_TANGENT_NORM_STAR * dq_unit
+            + (1.0 - has_tangent) * (1.0 - JET_NORMAL_ALPHA_STAR) * q_c,
+            dim=-1,
+        )
+
+        v_tan = q_t - (q_t * q_c).sum(dim=-1, keepdim=True) * q_c
+        # 法向负散度分量 (-0.65 * q_c) 控制散度门控 (div V < 0)，
+        # 切向推进分量 (2.5 * v_tan) 在 Module 5 切空间正交化滤除法向分量后直接推动状态滑向 q_target！
+        v_desired = 2.5 * v_tan - 0.65 * q_c
+
+        psi_heads = F.normalize(psi.view(N, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+        u_cb = F.normalize(pkg.u_codebook.detach().float(), dim=-1)
+        v_cb = F.normalize(pkg.v_codebook.detach().float(), dim=-1)
+
+        su = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 0, :], u_cb).mean(dim=1)
+        sv = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 1, :], v_cb).mean(dim=1)
+        r_star = su.argmax(dim=-1)
+        c_star = sv.argmax(dim=-1)
+        eids = r_star * pkg.grid_k + c_star
+        dev = psi.device
+
+        # 1. 向量化记录相邻时间步的测地流线转移边 (零循环)
+        if N > 1:
+            diff_step = eids[:-1] != eids[1:]
+            if bool(diff_step.any()):
+                pkg.record_streamline_transition(eids[:-1][diff_step], eids[1:][diff_step])
+
+        # 2. 按唯一命中的微专家页号执行张量级球面重心聚合 (unique_eids, inverse_indices, hit_counts)
+        unique_eids, inverse_indices, hit_counts = torch.unique(
+            eids, sorted=True, return_inverse=True, return_counts=True
+        )
+        u_cnt = int(unique_eids.numel())
+        if u_cnt == 0:
+            return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0}
+
+        psi_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
+        v_des_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
+        psi_sum.index_add_(0, inverse_indices, psi)
+        v_des_sum.index_add_(0, inverse_indices, v_desired)
+        inv_cnt = (1.0 / hit_counts.float()).unsqueeze(-1)
+        psi_bar = F.normalize(psi_sum * inv_cnt, dim=-1)
+        v_des_bar = v_des_sum * inv_cnt
+
+        # 3. 批量读取唯一命中页的存量 (u_old, v_old) 与状态
+        u_old, v_old = pkg.dequantize_expert_uv(unique_eids)
+        is_empty_u = pkg.scales[unique_eids, 1] <= 1e-6
+        cos_v_u = F.cosine_similarity(v_old, v_des_bar, dim=-1)
+
+        tok_to_bar_cos = F.cosine_similarity(v_desired, v_des_bar[inverse_indices], dim=-1)
+        intra_fork_mask = (hit_counts[inverse_indices] > 1) & (tok_to_bar_cos < SIMPLEX_2_GEODESIC_PROJ)
+
+        first_occ = torch.zeros(u_cnt, dtype=torch.long, device=dev)
+        if bool(intra_fork_mask.any()):
+            rev_idx = torch.arange(N - 1, -1, -1, device=dev, dtype=torch.long)
+            first_occ.index_copy_(0, inverse_indices[rev_idx], rev_idx)
+            has_intra_u = torch.zeros(u_cnt, dtype=torch.bool, device=dev)
+            has_intra_u.index_fill_(0, inverse_indices[intra_fork_mask], True)
+            psi_bar = torch.where(has_intra_u.unsqueeze(-1), psi[first_occ], psi_bar)
+            v_des_bar = torch.where(has_intra_u.unsqueeze(-1), v_desired[first_occ], v_des_bar)
+            cos_v_u = F.cosine_similarity(v_old, v_des_bar, dim=-1)
+
+        existing_mitosis_u = enable_auto_mitosis & (~is_empty_u) & (cos_v_u < SIMPLEX_2_GEODESIC_PROJ)
+        direct_update_u = ~existing_mitosis_u
+        return self._apply_batched_kaczmarz_and_mitosis(
+            pkg, unique_eids, inverse_indices, hit_counts, psi, v_desired, r_star,
+            psi_bar, v_des_bar, u_old, v_old, is_empty_u, cos_v_u,
+            direct_update_u, existing_mitosis_u, intra_fork_mask, first_occ,
+            snap_rate, enable_auto_mitosis,
+        )
+
+    @torch.no_grad()
+    def _apply_batched_kaczmarz_and_mitosis(
+        self,
+        pkg: PMCPackage,
+        unique_eids: torch.Tensor,
+        inverse_indices: torch.Tensor,
+        hit_counts: torch.Tensor,
+        psi: torch.Tensor,
+        v_desired: torch.Tensor,
+        r_star: torch.Tensor,
+        psi_bar: torch.Tensor,
+        v_des_bar: torch.Tensor,
+        u_old: torch.Tensor,
+        v_old: torch.Tensor,
+        is_empty_u: torch.Tensor,
+        cos_v_u: torch.Tensor,
+        direct_update_u: torch.Tensor,
+        existing_mitosis_u: torch.Tensor,
+        intra_fork_mask: torch.Tensor,
+        first_occ: torch.Tensor,
+        snap_rate: float,
+        enable_auto_mitosis: bool,
+    ) -> Dict[str, Any]:
+        # 4. 对所有非冲突唯一页 (空白页初始化 + 存量非空页 Kaczmarz & Rodrigues 旋转) 一次性张量批处理写入
+        if bool(direct_update_u.any()):
+            upd_eids = unique_eids[direct_update_u]
+            upd_empty = is_empty_u[direct_update_u]
+            u_old_d = u_old[direct_update_u]
+            v_old_d = v_old[direct_update_u]
+            psi_d = psi_bar[direct_update_u]
+            v_des_d = v_des_bar[direct_update_u]
+            cnt_d = hit_counts[direct_update_u]
+            cos_d = cos_v_u[direct_update_u]
+
+            h_m = pkg.activation_counts[upd_eids].float() + cnt_d.float()
+            r_m = pkg.purity_r[upd_eids].float()
+            gamma_js = torch.where(
+                h_m > 1.5,
+                ((h_m * r_m.pow(2) - 1.0) / (h_m - 1.0).clamp_min(1.0)).clamp(0.0, 0.95),
+                torch.zeros_like(h_m),
+            ).unsqueeze(-1)
+
+            res_v = v_des_d - v_old_d
+            v_unit = F.normalize(v_old_d, dim=-1)
+            res_parallel = (res_v * v_unit).sum(dim=-1, keepdim=True) * v_unit
+            res_perp = res_v - res_parallel
+            v_kacz = v_old_d + float(snap_rate) * (res_parallel + (1.0 - gamma_js) * res_perp)
+
+            step_frac = (float(snap_rate) * torch.rsqrt(h_m.clamp_min(1.0))).clamp(max=1.0).unsqueeze(-1)
+            u_unit_old = F.normalize(u_old_d, dim=-1)
+            q_unit_d = F.normalize(psi_d, dim=-1)
+            cos_th = (u_unit_old * q_unit_d).sum(dim=-1, keepdim=True).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            theta = torch.acos(cos_th) * step_frac
+            w_perp = F.normalize(q_unit_d - cos_th * u_unit_old, dim=-1)
+            u_rodrigues = F.normalize(torch.cos(theta) * u_unit_old + torch.sin(theta) * w_perp, dim=-1)
+
+            u_final = torch.where(upd_empty.unsqueeze(-1), q_unit_d, u_rodrigues) * math.sqrt(float(D_BKP))
+            v_final = torch.where(upd_empty.unsqueeze(-1), v_des_d, v_kacz)
+
+            pkg.write_experts_to_mmap_pages(upd_eids, u_final, v_final)
+            pkg.activation_counts[upd_eids] += cnt_d.to(pkg.activation_counts.dtype)
+            new_pur = torch.where(
+                upd_empty,
+                torch.ones_like(r_m),
+                (0.85 * r_m + 0.15 * cos_d.clamp_min(0.0)).clamp(0.5, 1.0),
+            )
+            pkg.purity_r[upd_eids] = new_pur
+
+            if bool(upd_empty.any()):
+                emp_eids = upd_eids[upd_empty]
+                emp_psi_h = F.normalize(psi_d[upd_empty].view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+                r_emp = torch.div(emp_eids, pkg.grid_k, rounding_mode="floor")
+                c_emp = emp_eids % pkg.grid_k
+                pkg.u_codebook.data[:, r_emp, :] = PMCPackage.rodrigues_geodesic_rotation(
+                    pkg.u_codebook.data[:, r_emp, :], emp_psi_h[:, :, 0, :].permute(1, 0, 2), step_fraction=0.5
+                )
+                pkg.v_codebook.data[:, c_emp, :] = PMCPackage.rodrigues_geodesic_rotation(
+                    pkg.v_codebook.data[:, c_emp, :], emp_psi_h[:, :, 1, :].permute(1, 0, 2), step_fraction=0.5
+                )
+
+        return self._apply_batched_mitosis_spawns(
+            pkg, unique_eids, psi, v_desired, r_star, psi_bar, v_des_bar,
+            direct_update_u, existing_mitosis_u, intra_fork_mask, first_occ, enable_auto_mitosis,
+        )
+
+    @torch.no_grad()
+    def _apply_batched_mitosis_spawns(
+        self,
+        pkg: PMCPackage,
+        unique_eids: torch.Tensor,
+        psi: torch.Tensor,
+        v_desired: torch.Tensor,
+        r_star: torch.Tensor,
+        psi_bar: torch.Tensor,
+        v_des_bar: torch.Tensor,
+        direct_update_u: torch.Tensor,
+        existing_mitosis_u: torch.Tensor,
+        intra_fork_mask: torch.Tensor,
+        first_occ: torch.Tensor,
+        enable_auto_mitosis: bool,
+    ) -> Dict[str, Any]:
+        dev = psi.device
+        mitosis_psi_list: List[torch.Tensor] = []
+        mitosis_v_list: List[torch.Tensor] = []
+        mitosis_rows_list: List[torch.Tensor] = []
+        if bool(existing_mitosis_u.any()):
+            mit_eids_u = unique_eids[existing_mitosis_u]
+            mitosis_psi_list.append(psi_bar[existing_mitosis_u])
+            mitosis_v_list.append(v_des_bar[existing_mitosis_u])
+            mitosis_rows_list.append(torch.div(mit_eids_u, pkg.grid_k, rounding_mode="floor"))
+        if enable_auto_mitosis and bool(intra_fork_mask.any()):
+            non_first_fork = intra_fork_mask.clone()
+            non_first_fork[first_occ] = False
+            if bool(non_first_fork.any()):
+                mitosis_psi_list.append(psi[non_first_fork])
+                mitosis_v_list.append(v_desired[non_first_fork])
+                mitosis_rows_list.append(r_star[non_first_fork])
+
+        mitosis_count = 0
+        if len(mitosis_psi_list) > 0:
+            m_psi = torch.cat(mitosis_psi_list, dim=0)
+            m_v = torch.cat(mitosis_v_list, dim=0)
+            m_rows = torch.cat(mitosis_rows_list, dim=0)
+            mitosis_count = int(m_psi.size(0))
+
+            empty_mask_2d = (pkg.scales[:, 1] <= 1e-6).view(pkg.grid_k, pkg.grid_k).clone()
+            target_eids = torch.empty(mitosis_count, dtype=torch.long, device=dev)
+            target_cols = torch.empty(mitosis_count, dtype=torch.long, device=dev)
+            for m_i in range(mitosis_count):
+                r_i = m_rows[m_i]
+                avail_c = torch.nonzero(empty_mask_2d[r_i], as_tuple=False).squeeze(-1)
+                if avail_c.numel() > 0:
+                    c_sel = avail_c[0]
+                    empty_mask_2d[r_i, c_sel] = False
+                    target_cols[m_i] = c_sel
+                    target_eids[m_i] = r_i * pkg.grid_k + c_sel
+                else:
+                    pkg._needs_quadrant_expand = True
+                    any_emp = torch.nonzero(empty_mask_2d.view(-1), as_tuple=False).squeeze(-1)
+                    t_eid = any_emp[0] if any_emp.numel() > 0 else (r_i * pkg.grid_k)
+                    empty_mask_2d.view(-1)[t_eid] = False
+                    target_cols[m_i] = t_eid % pkg.grid_k
+                    target_eids[m_i] = t_eid
+
+            m_u_scaled = F.normalize(m_psi, dim=-1) * math.sqrt(float(D_BKP))
+            pkg.write_experts_to_mmap_pages(target_eids, m_u_scaled, m_v)
+            pkg.activation_counts[target_eids] += 1
+            pkg.purity_r[target_eids] = 1.0
+            m_psi_h = F.normalize(m_psi.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+            pkg.v_codebook.data[:, target_cols, :] = PMCPackage.rodrigues_geodesic_rotation(
+                pkg.v_codebook.data[:, target_cols, :], m_psi_h[:, :, 1, :].permute(1, 0, 2), step_fraction=0.85
+            )
+
+        updated_count = int(direct_update_u.sum()) + mitosis_count
+        self.total_kaczmarz_snaps += updated_count
+        self.total_mitosis_spawns += mitosis_count
+        return {
+            "updated_pages": int(updated_count),
+            "mitosis_pages": int(mitosis_count),
+            "total_kaczmarz_snaps": int(self.total_kaczmarz_snaps),
+            "total_mitosis_spawns": int(self.total_mitosis_spawns),
+            "optimizer_memory_bytes": 0,
+        }
+
+    @torch.no_grad()
+    def spawn_specialist_package_from_queries(
+        self,
+        new_pkg_id: str,
+        grid_k: int = 64,
+        mmap_file_path: Optional[str] = None,
+        mount_mode: PMCMountMode = PMCMountMode.RW_SHARED,
+        init_scale_v: float = 1e-5,
+    ) -> PMCPackage:
+        """
+        自治拓扑算子 6: Auto-Spawn (球面未知流形新包孵化，返回 PMCPackage)
+        """
+        base_spawned = super().spawn_specialist_package_from_queries(
+            new_pkg_id=new_pkg_id,
+            grid_k=grid_k,
+            mmap_file_path=None,
+            mount_mode=mount_mode,
+            init_scale_v=init_scale_v,
+        )
+        dev = base_spawned.u_codebook.device
+        pmc_pkg = PMCPackage(
+            pkg_id=new_pkg_id,
+            grid_k=grid_k,
+            mount_mode=mount_mode,
+            is_base_pkg=base_spawned.is_base_pkg,
+            mmap_file_path=mmap_file_path,
+            device=dev,
+        )
+        pmc_pkg._copy_manifold_stats_from(base_spawned)
+        pmc_pkg.codebook_pre_centered.copy_(base_spawned.codebook_pre_centered)
+        pmc_pkg._codebook_pre_centered_cached = base_spawned._codebook_pre_centered_cached
+        pmc_pkg.u_codebook.data.copy_(base_spawned.u_codebook.data)
+        pmc_pkg.v_codebook.data.copy_(base_spawned.v_codebook.data)
+        pmc_pkg.expert_pages_int8.copy_(base_spawned.expert_pages_int8)
+        pmc_pkg.scales.copy_(base_spawned.scales)
+        pmc_pkg.activation_counts.copy_(base_spawned.activation_counts)
+        pmc_pkg.purity_r.copy_(base_spawned.purity_r)
+        pmc_pkg._rebuild_runtime_buffers_after_topology_change()
+
+        self.unmount_package(new_pkg_id)
+        self.mount_package(pmc_pkg, pin_to_l1=True)
+        return pmc_pkg
+
+    @torch.no_grad()
+    def snapshot_forest_state(self, step: int = 0) -> Dict[str, Any]:
+        pkgs_info: List[Dict[str, Any]] = []
+        for pid, pkg in self.packages.items():
+            woken = int((pkg.activation_counts > 0).sum().item())
+            active_sv = int((pkg.scales[:, 1] > 1e-6).sum().item())
+            poly_cnt = int(pkg.detect_polysemy_interference_mask().sum().item())
+            stream_edges = int((pkg.stream_next_ptr >= 0).sum().item()) if isinstance(pkg, PMCPackage) else 0
+            pkgs_info.append({
+                "pkg_id": pkg.pkg_id,
+                "is_pmc_package": isinstance(pkg, PMCPackage),
+                "grid_k": int(pkg.grid_k),
+                "num_experts": int(pkg.num_experts),
+                "woken_experts": woken,
+                "active_scale_v_experts": active_sv,
+                "woken_ratio": round(woken / float(max(1, pkg.num_experts)), 4),
+                "polysemy_conflict_experts": poly_cnt,
+                "streamline_edges": stream_edges,
+                "in_l1_tlb": bool(pkg.pkg_id in self.l1_active_pkg_ids),
+                "is_bridge_pkg": bool(pkg.is_bridge_pkg),
+            })
+        return {
+            "step": int(step),
+            "total_mounted_packages": len(self.packages),
+            "l1_active_pkg_ids": list(self.l1_active_pkg_ids),
+            "operator_totals": {
+                "split_count": int(self.split_count),
+                "expand_count": int(self.expand_count),
+                "merge_count": int(self.merge_count),
+                "spawn_count": int(self.spawn_count),
+                "closure_count": int(self.closure_count),
+                "mitosis_spawns": int(self.total_mitosis_spawns),
+                "kaczmarz_snaps": int(self.total_kaczmarz_snaps),
+            },
+            "packages": pkgs_info,
+        }
+
+    @torch.no_grad()
+    def step_autonomous_forest_evolution(
+        self,
+        step: int,
+        q_probe: Optional[torch.Tensor] = None,
+        domain_hint: str = "general",
+        max_grid_k: int = 256,
+        max_total_packages: int = 16,
+    ) -> List[Dict[str, Any]]:
+        """
+        Penrose v1.0 内聚自治森林六大演化算子调度引擎（100% 零超参数闭式几何触发判据）：
+          1. Auto-Split   : 公理 10 二分图拉普拉斯谱双聚类裂变 (cross_ratio <= 1 - 1/sqrt(2)) + BridgeAB
+          2. Auto-Expand  : 公理 9 四象限 (a+b)^2 无损倍增扩容 (woken_ratio >= 1 - exp(-1/sqrt(2)) 或同行满载)
+          3. Auto-Merge   : 公理 9 跨包三元正交聚变 (coactivation_ratio >= sqrt(2) - 1)
+          4. Auto-Spawn   : 公理 2 冈贝尔极值尾概率未知流形新包孵化 (low_hit_ratio >= 0.5*erfc(tau_z*(64)/sqrt(2)))
+          5. Auto-Closure : Insight 5 双正交笛卡尔闭包成核 (R^1024 (+) R^1024 交叉格点结晶)
+          6. Auto-Mitosis : 公理 7 & 8 切向复共轭有丝分裂 (H_m*R_m^2 > ln(N) 且 R_m < 1/sqrt(2))
+        """
+        events: List[Dict[str, Any]] = []
+        split_cross_max = 1.0 - SIMPLEX_2_GEODESIC_PROJ
+        expand_woken_thresh = 1.0 - math.exp(-SIMPLEX_2_GEODESIC_PROJ)
+        merge_coact_min = (1.0 / SIMPLEX_2_GEODESIC_PROJ) - 1.0
+        tau_64 = closed_form_gumbel_threshold(64.0)
+        spawn_tail_min = 0.5 * math.erfc(tau_64 / math.sqrt(2.0))
+
+        # 1. Auto-Split (谱双聚类裂变)
+        for pid in list(self.l1_active_pkg_ids):
+            if len(self.packages) >= max_total_packages:
+                break
+            mk = self._mod_key(pid)
+            if mk not in self.packages:
+                continue
+            pkg = self.packages[mk]
+            if pkg.is_bridge_pkg or pkg.grid_k < 128:
+                continue
+            woken_cnt = int((pkg.activation_counts > 0).sum().item())
+            if woken_cnt < max(16, pkg.grid_k // 2):
+                continue
+            split_res = pkg.bkp_split_spectral(cross_ratio_threshold=split_cross_max, return_bridge=True)
+            if split_res is not None:
+                pkg_a, pkg_b, pkg_bridge = split_res
+                self.split_count += 1
+                stem = pid.replace(".pmc", "").replace(".bkp", "")
+                pkg_a.pkg_id = f"{stem}_SubA_s{step}.pmc"
+                pkg_b.pkg_id = f"{stem}_SubB_s{step}.pmc"
+                pkg_a.is_base_pkg = pkg.is_base_pkg
+                pkg_b.is_base_pkg = False
+                self.unmount_package(pid)
+                self.mount_package(pkg_a, pin_to_l1=True)
+                self.mount_package(pkg_b, pin_to_l1=True)
+                bridge_id = None
+                if pkg_bridge is not None:
+                    bridge_id = f"{stem}_BridgeAB_s{step}.pmc"
+                    pkg_bridge.pkg_id = bridge_id
+                    pkg_bridge.is_bridge_pkg = True
+                    self.mount_package(pkg_bridge, pin_to_l1=True)
+                ev = {
+                    "step": int(step),
+                    "op": "Auto-Split",
+                    "parent_pkg": pid,
+                    "child_a": pkg_a.pkg_id,
+                    "child_b": pkg_b.pkg_id,
+                    "bridge_pkg": bridge_id,
+                    "grid_k": f"{pkg.grid_k} -> ({pkg_a.grid_k}, {pkg_b.grid_k})",
+                }
+                events.append(ev)
+                self.forest_events.append(ev)
+                break
+
+        # 2. Auto-Expand (四象限倍增扩容)
+        if len(events) == 0:
+            for pid in list(self.l1_active_pkg_ids):
+                mk = self._mod_key(pid)
+                if mk not in self.packages:
+                    continue
+                pkg = self.packages[mk]
+                if pkg.is_bridge_pkg or pkg.grid_k >= max_grid_k:
+                    continue
+                woken_ratio = float((pkg.activation_counts > 0).float().mean().item())
+                poly_cnt = int(pkg.detect_polysemy_interference_mask().sum().item())
+                needs_exp = getattr(pkg, "_needs_quadrant_expand", False)
+                if woken_ratio >= expand_woken_thresh or poly_cnt >= pkg.grid_k or needs_exp:
+                    old_k = pkg.grid_k
+                    pkg.expand_quadrant_2x()
+                    self.vram_cache.evict_package(pkg.pkg_id)
+                    self.expand_count += 1
+                    ev = {
+                        "step": int(step),
+                        "op": "Auto-Expand",
+                        "pkg_id": pkg.pkg_id,
+                        "old_grid_k": int(old_k),
+                        "new_grid_k": int(pkg.grid_k),
+                        "woken_ratio_before": round(woken_ratio, 4),
+                        "polysemy_conflicts": int(poly_cnt),
+                    }
+                    events.append(ev)
+                    self.forest_events.append(ev)
+                    break
+
+        return self._step_autonomous_forest_evolution_part2(
+            step, events, merge_coact_min, spawn_tail_min, q_probe, domain_hint, max_grid_k, max_total_packages
+        )
+
+    @torch.no_grad()
+    def _step_autonomous_forest_evolution_part2(
+        self,
+        step: int,
+        events: List[Dict[str, Any]],
+        merge_coact_min: float,
+        spawn_tail_min: float,
+        q_probe: Optional[torch.Tensor],
+        domain_hint: str,
+        max_grid_k: int,
+        max_total_packages: int,
+    ) -> List[Dict[str, Any]]:
+        # 3. Auto-Merge (跨包三元正交聚变)
+        if len(events) == 0 and len(self.pkg_coactivation_counts) > 0:
+            best_pair: Optional[Tuple[str, str]] = None
+            best_ratio = 0.0
+            for (pa, pb), co_cnt in self.pkg_coactivation_counts.items():
+                if self._mod_key(pa) not in self.packages or self._mod_key(pb) not in self.packages:
+                    continue
+                pkg_a = self.packages[self._mod_key(pa)]
+                pkg_b = self.packages[self._mod_key(pb)]
+                if pkg_a.is_bridge_pkg or pkg_b.is_bridge_pkg or (pkg_a.grid_k + pkg_b.grid_k > max_grid_k):
+                    continue
+                denom = min(self.pkg_token_hit_counts.get(pa, 0.0), self.pkg_token_hit_counts.get(pb, 0.0))
+                if denom < 4.0:
+                    continue
+                ratio = co_cnt / max(denom, 1.0)
+                if ratio >= merge_coact_min and ratio > best_ratio:
+                    best_ratio = ratio
+                    best_pair = (pa, pb)
+            if best_pair is not None:
+                pa, pb = best_pair
+                pkg_a = self.packages[self._mod_key(pa)]
+                pkg_b = self.packages[self._mod_key(pb)]
+                merged_id = f"TriadicMerge_{self.merge_count + 1}_s{step}.pmc"
+                merged_pkg = PMCPackage.bkp_merge_triadic_bundle(pkg_a, pkg_b, merged_id=merged_id)
+                self.unmount_package(pa)
+                self.unmount_package(pb)
+                self.mount_package(merged_pkg, pin_to_l1=True)
+                self.merge_count += 1
+                ev = {
+                    "step": int(step),
+                    "op": "Auto-Merge",
+                    "pkg_a": pa,
+                    "pkg_b": pb,
+                    "merged_pkg": merged_id,
+                    "coactivation_ratio": round(best_ratio, 4),
+                    "new_grid_k": int(merged_pkg.grid_k),
+                }
+                events.append(ev)
+                self.forest_events.append(ev)
+
+        # 4. Auto-Spawn (未知流形新包孵化)
+        if len(events) == 0 and len(self.packages) < max_total_packages:
+            total_q = max(1, int(getattr(self, "_total_periodic_queries", 0)))
+            low_q = int(getattr(self, "_low_hit_periodic_queries", 0))
+            low_ratio = low_q / float(total_q)
+            has_pool = self._low_hit_q1_reservoir is not None and self._low_hit_q1_reservoir.size(0) >= 8
+            if has_pool and low_ratio >= spawn_tail_min:
+                self.spawn_count += 1
+                new_id = f"Spec_{domain_hint}_{self.spawn_count}_s{step}.pmc"
+                new_pkg = self.spawn_specialist_package_from_queries(new_pkg_id=new_id, grid_k=64)
+                ev = {
+                    "step": int(step),
+                    "op": "Auto-Spawn",
+                    "new_pkg": new_pkg.pkg_id,
+                    "domain": domain_hint,
+                    "low_hit_ratio": round(low_ratio, 4),
+                    "grid_k": int(new_pkg.grid_k),
+                }
+                events.append(ev)
+                self.forest_events.append(ev)
+
+        # 5. Auto-Closure (双正交笛卡尔闭包成核) & 6. Auto-Mitosis (存量切向复共轭叶状分裂)
+        for pid in list(self.l1_active_pkg_ids):
+            mk = self._mod_key(pid)
+            if mk not in self.packages:
+                continue
+            pkg = self.packages[mk]
+            if pkg.is_bridge_pkg:
+                continue
+            c_info = pkg.crystallize_biorthogonal_manifold_closure(max_crystallize_slots=64)
+            n_cryst = int(c_info.get("crystallized_count", 0))
+            if n_cryst > 0:
+                self.closure_count += n_cryst
+                ev = {
+                    "step": int(step),
+                    "op": "Auto-Closure",
+                    "pkg_id": pkg.pkg_id,
+                    "crystallized_count": n_cryst,
+                }
+                events.append(ev)
+                self.forest_events.append(ev)
+
+            m_info = pkg.nucleate_tangential_conjugate_mitosis(max_mitosis_slots=64)
+            n_mit = int(m_info.get("mitosis_count", 0))
+            if n_mit > 0:
+                self.total_mitosis_spawns += n_mit
+                ev = {
+                    "step": int(step),
+                    "op": "Auto-Mitosis",
+                    "pkg_id": pkg.pkg_id,
+                    "mitosis_count": n_mit,
+                    "mean_conjugate_cos": round(float(m_info.get("mean_conjugate_cos", -1.0)), 4),
+                }
+                events.append(ev)
+                self.forest_events.append(ev)
+
+        if q_probe is not None and len(self.packages) > len(self.l1_active_pkg_ids):
+            self.step_l2_page_walker(q_probe.detach())
+
+        self.reset_coactivation_stats()
+        return events
+
+

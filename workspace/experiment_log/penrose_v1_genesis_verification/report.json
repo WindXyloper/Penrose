@@ -1,0 +1,212 @@
+{
+  "device": "cuda",
+  "exp1_holographic_wavepacket_8x256": {
+    "learnable_params": 0,
+    "inter_byte_dot": 0.0,
+    "inter_slot_dot": 0.0,
+    "head_energy_uniformity_err": 1e-08,
+    "roundtrip_accuracy": "9/9 (100.0%)",
+    "ab_vs_ba_cosine": 0.0
+  },
+  "exp2_two_tier_negative_divergence_funnel": {
+    "cold_start_packets": 14,
+    "cold_start_chunks": [
+      "{",
+      "text",
+      ": \"",
+      "这",
+      "是",
+      "一",
+      "段",
+      "训",
+      "练",
+      "语",
+      "料",
+      "。",
+      "\"",
+      "}"
+    ],
+    "warm_funnel_packets": 12,
+    "warm_funnel_chunks": [
+      "{",
+      "text",
+      ": \"",
+      "这",
+      "是",
+      "一",
+      "段",
+      "训练",
+      "语料",
+      "。",
+      "\"",
+      "}"
+    ],
+    "shell_prefix_isolated": [
+      "{",
+      "text",
+      ": \""
+    ]
+  },
+  "exp3_mpu_five_module_and_tri_state_bus": {
+    "vocab_size": 0,
+    "module2_layers": 6,
+    "module4_layers": 6,
+    "module1_psi0_norm_err": 6e-08,
+    "module1_prefetched_pages": 24,
+    "module5_tangent_orthogonality_err": 1.5e-07,
+    "module5_q_next_norm_err": 6e-08,
+    "branch_c_chord_loss": 0.999638,
+    "tri_state_branch_trace": [
+      "branch_a_curl_loop",
+      "branch_a_curl_loop",
+      "branch_b_sink_emit"
+    ]
+  },
+  "exp4_adamw_free_kaczmarz_and_dirty_shell": {
+    "pmc_optimizer_memory_bytes": 0,
+    "doc1_loss_before_to_after": "0.9905 -> 0.3584",
+    "doc2_loss_before_to_after": "0.8473 -> 0.5077",
+    "total_kaczmarz_snaps": 35,
+    "total_mitosis_spawns": 12,
+    "clean_query_json_leakage": false
+  },
+  "exp5_manifold_puncture_c1_simplex_healing": {
+    "punctured_center_eid": 0,
+    "healed_top_neighbors": [
+      1,
+      2,
+      3
+    ],
+    "c1_simplex_healing_cosine": 0.999977,
+    "healed_to_true_field_cosine": 0.999681
+  },
+  "exp6_six_autonomous_forest_ops_and_wormhole": {
+    "all_packages_are_pmc": true,
+    "stream_ptr_remapped_eid": 129,
+    "expand_zero_step_err": 0.0,
+    "operator_totals": {
+      "split_count": 1,
+      "expand_count": 1,
+      "merge_count": 1,
+      "spawn_count": 1,
+      "closure_count": 1,
+      "mitosis_spawns": 0,
+      "kaczmarz_snaps": 0
+    },
+    "wormhole_mitosis_switches": 1
+  },
+  "end_to_end_training_15steps": {
+    "architecture": "Penrose-v1.0 (MPU + PMC + Harness)",
+    "vocab_size": 0,
+    "pmc_optimizer_memory_bytes": 0,
+    "steps": 15,
+    "elapsed_sec": 36.294,
+    "history": [
+      {
+        "step": 1,
+        "num_wavepackets": 32,
+        "loss_before": 0.91628,
+        "loss_after": 0.266776,
+        "active_pages": 35,
+        "mitosis_spawns": 9,
+        "closure_count": 0,
+        "forest_events": []
+      },
+      {
+        "step": 5,
+        "num_wavepackets": 32,
+        "loss_before": 0.452827,
+        "loss_after": 0.803383,
+        "active_pages": 4272,
+        "mitosis_spawns": 52,
+        "closure_count": 64,
+        "forest_events": [
+          {
+            "step": 5,
+            "op": "Auto-Spawn",
+            "new_pkg": "Spec_general_1_s5.pmc",
+            "domain": "general",
+            "low_hit_ratio": 0.3644,
+            "grid_k": 64
+          },
+          {
+            "step": 5,
+            "op": "Auto-Closure",
+            "pkg_id": "Base_v1.pmc",
+            "crystallized_count": 64
+          }
+        ]
+      },
+      {
+        "step": 10,
+        "num_wavepackets": 37,
+        "loss_before": 0.472533,
+        "loss_after": 0.406272,
+        "active_pages": 4045,
+        "mitosis_spawns": 149,
+        "closure_count": 384,
+        "forest_events": [
+          {
+            "step": 10,
+            "op": "Auto-Split",
+            "parent_pkg": "Spec_general_1_s5.pmc",
+            "child_a": "Spec_general_1_s5_SubA_s10.pmc",
+            "child_b": "Spec_general_1_s5_SubB_s10.pmc",
+            "bridge_pkg": "Spec_general_1_s5_BridgeAB_s10.pmc",
+            "grid_k": "128 -> (64, 64)"
+          },
+          {
+            "step": 10,
+            "op": "Auto-Closure",
+            "pkg_id": "Base_v1.pmc",
+            "crystallized_count": 64
+          },
+          {
+            "step": 10,
+            "op": "Auto-Closure",
+            "pkg_id": "Spec_general_1_s5_SubA_s10.pmc",
+            "crystallized_count": 64
+          },
+          {
+            "step": 10,
+            "op": "Auto-Closure",
+            "pkg_id": "Spec_general_1_s5_SubB_s10.pmc",
+            "crystallized_count": 64
+          }
+        ]
+      },
+      {
+        "step": 15,
+        "num_wavepackets": 20,
+        "loss_before": 0.403896,
+        "loss_after": 0.301242,
+        "active_pages": 4196,
+        "mitosis_spawns": 208,
+        "closure_count": 512,
+        "forest_events": [
+          {
+            "step": 15,
+            "op": "Auto-Merge",
+            "pkg_a": "Base_v1.pmc",
+            "pkg_b": "Spec_general_1_s5_SubB_s10.pmc",
+            "merged_pkg": "TriadicMerge_1_s15.pmc",
+            "coactivation_ratio": 0.9406,
+            "new_grid_k": 128
+          },
+          {
+            "step": 15,
+            "op": "Auto-Closure",
+            "pkg_id": "Spec_general_1_s5_SubA_s10.pmc",
+            "crystallized_count": 64
+          },
+          {
+            "step": 15,
+            "op": "Auto-Closure",
+            "pkg_id": "TriadicMerge_1_s15.pmc",
+            "crystallized_count": 64
+          }
+        ]
+      }
+    ]
+  }
+}

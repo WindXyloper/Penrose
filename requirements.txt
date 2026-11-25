@@ -1,0 +1,16 @@
+# 核心数值计算 (需 < 2.3 以确保与 PyTorch 2.x C++ 扩展完全兼容)
+numpy>=1.26.0,<2.3.0
+
+# 分词器核心 (加载与训练 workspace/tokenizer/tokenizer.json 必需)
+tokenizers>=0.19.0
+
+# 离线语料下载与编译 (prepare_workspace.py 使用，含 zstd 解压支持)
+datasets>=2.19.0
+huggingface-hub>=0.23.0
+pyarrow>=15.0.0
+zstandard>=0.22.0
+tqdm>=4.66.0
+
+# 训练监控与 metrics.jsonl 曲线绘图 (Coder 网页 IDE 内直接看图很方便)
+psutil>=5.9.0
+matplotlib>=3.8.0

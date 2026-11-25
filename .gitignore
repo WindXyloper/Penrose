@@ -1,0 +1,58 @@
+# Secrets, credentials & private remote ops scripts (NEVER commit to public repo)
+API_key.txt
+ssh.txt
+*.pem
+*.key
+*.ps1
+relogin_coder.ps1
+remote_bridge.py
+run_experiment.sh
+.clinerules
+read_log.py
+_archive_old_bicamera.py
+pyrightconfig.json
+升级思路.md
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Virtual environments & IDE
+.venv/
+venv/
+ENV/
+.vscode/
+.idea/
+
+# Workspace runtime files, binary checkpoints, cartridges & logs
+workspace/*
+!workspace/experiment_log/
+workspace/experiment_log/*
+!workspace/experiment_log/penrose_v1_genesis_verification/
+!workspace/experiment_log/insight7_manifold_algebra_and_mitosis/
+!workspace/experiment_log/insight8_vector_field_div_curl_stokes/
+!workspace/old_bicamera/
+workspace/old_bicamera/*
+!workspace/old_bicamera/bicamera_kernel_draft.py
+!workspace/old_bicamera/bkp_manager.py
+!workspace/old_bicamera/distill_autonomous_forest.py
+!workspace/old_bicamera/README.md
+!workspace/old_bicamera/学术发现.md
+
+# Binary weights & manifold cartridges
+*.pt
+*.pth
+*.bin
+*.bkp
+*.pmc
+*.nohup
+*.pid
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
