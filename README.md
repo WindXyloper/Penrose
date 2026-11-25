@@ -3,21 +3,22 @@
 > **从离散静态词表（Tokenizer + Embedding + LM Head）向连续单位超球面状态推进器（$\mathbb{S}^{2047}$ Manifold Processing Unit）的代际跃迁**
 >
 > - **代码许可协议（Code License）**：`MPU`（`penrose_mpu.py`）、`PMC` 引擎（`penrose_pmc.py`）、`Penrose Harness`（`penrose_harness.py`）等核心机制代码遵循 **[GNU AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html)** 协议。
-> - **流形记忆包许可协议（Manifold Cartridge License）**：所有训练、蒸馏与结晶生成的 **`.pmc` 文件**遵循 **[CC-BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)** 协议。
+> - **流形记忆块许可协议（Manifold Chunk License）**：所有训练、蒸馏与结晶生成的 **`.pmc`（Penrose Manifold Chunk）文件**遵循 **[CC-BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)** 协议。
 > - *历史初代验证架构 `Bicamera (v1 ~ v42)` 核心算法机制与学术账本已归档至 `workspace/old_bicamera/`。*
 
 
 ---
 
-## 一、 架构总览：现代流形计算机三大核心部件
+## 一、 架构总览与七步第一性原理
 
-**`Penrose v1.0`** 彻底终结了传统大语言模型将计算内核死绑在几万行静态词表（`nn.Embedding` 与 `LM Head Softmax`）以及海量优化器状态（`AdamW` $m_t, v_t$）上的旧范式，确立了与现代冯·诺依曼计算机严格同构的三位一体架构：
+> **Penrose 第一性原理全景**：任何自洽的信息系统皆内禀一个微分流形 $\mathcal{M}^k$；通过零参数沃尔什-阿达玛全息换能器 $\mathbf{H}_8 \otimes \mathbf{H}_{256}$ 与纳什高余维等距嵌入，万物皆无损嵌入于同一个 **2048 维母体单位超球面 $\mathbb{S}^{2047}$**；每个 4KB 微专家 $(u_m, v_m)$ 是钉在母体超球面上的**嘉当活动标架（Cartan Moving Frame）**；每个 `.pmc`（**Penrose Manifold Chunk**）是贴合在母体超球面特定区域上的**自适应分辨率局部坐标卡（Local Coordinate Chart）**，而 `BridgeAB.pmc` 则是跨板块跃迁的**测地线联络桥（Transition Bundle）**，与数据微专家、指令微专家共同构成霍奇分解定理（Hodge Decomposition）的三大正交极：
+> $$\mathbf{V}\big|_{\mathcal{M}} = \underbrace{\mathbf{V}_{\text{div}}}_{\text{数据微专家 }(\operatorname{div}<0)} \;\oplus\; \underbrace{\mathbf{V}_{\text{curl}}}_{\text{指令微专家 }(\operatorname{curl}\neq 0)} \;\oplus\; \underbrace{\mathcal{H}^1(\mathcal{M})}_{\text{拓扑调和虫洞场 / Bridge.pmc }\big(\dim\mathcal{H}^1(\mathcal{M}) = b_1(\mathcal{M})\big)}$$
 
 | 核心组件 | 全称与代码模块 | 现代计算机对标 | 核心数学与物理职责 |
 | :--- | :--- | :--- | :--- |
-| **`MPU`** | **Manifold Processing Unit**<br>(`penrose_mpu.py`) | **CPU / 算术逻辑控制核** | **0 词表参数**；严格实现「2048 维单位球面向量进 $\to$ 2048 维单位球面向量出」的五段式 12 层（8 注意力头）状态推进器：$q(\tau) \to q(\tau+1) \in \mathbb{S}^{2047}$。 |
-| **`PMC`** | **Penrose Manifold Cartridge**<br>(`penrose_pmc.py`, `.pmc`) | **4KB 虚拟内存页 / 固态流形盘** | **100% 物理同质微专家页** $(u_m, v_m) \in \mathbb{R}^{2 \times 2048}$；由十条零超参闭式公理驱动，根据散度/旋度自发分化为**数据微专家（负散度吸引盆 $\operatorname{div}\mathbf{V} < 0$）**与**指令微专家（无散旋度流 $\eta_{\text{curl}} \to 1$）**；采用 **0 字节优化器显存**的 Kaczmarz 单纯形正交投影与罗德里格斯大圆旋转一步锁死流形。 |
-| **`Penrose Harness`** | **Manifold Bus & OS Scheduler**<br>(`penrose_harness.py`) | **MMU + DMA 预取器 + 外围 I/O 换能总线** | 外置 **$2048 = 8 \times 256$ 沃尔什-阿达玛（Walsh-Hadamard）正交谐波全息波包换能器**（0 参数）與**双层负散度漏斗流式切分器**；管控 Module 5 出口的**硬件级三态总线分支（分支 A/B/C）**、早一轮白盒流线预取与自治森林四算子演化（`Auto-Mitosis / Expand / Split / Merge`）。 |
+| **`MPU`** | **Manifold Processing Unit**<br>(`penrose_mpu.py`) | **CPU / 测地线微分方程积分器** | **0 词表参数**；严格实现「2048 维单位球面向量进 $\to$ 2048 维单位球面向量出」的五段式 12 层（8 注意力头）状态推进器：$q(\tau) \to q(\tau+1) \in \mathbb{S}^{2047}$。 |
+| **`PMC`** | **Penrose Manifold Chunk**<br>(`penrose_pmc.py`, `.pmc`) | **4KB 局部坐标卡图册 / 固态流形盘** | **100% 物理同质嘉当活动标架** $(u_m, v_m) \in \mathbb{R}^{2 \times 2048}$；在简单流形区稀疏分布并由球面 $\ell_2$ 单位分解平滑插值，在复杂高曲率区通过 `Auto-Mitosis`（叶状分支）与 `Auto-Split`（分流形 `SubA/SubB` + 联络桥 `BridgeAB`）自适应加密；采用 **0 字节优化器显存**的 Kaczmarz 正交投影与罗德里格斯大圆旋转一步锁死流形。 |
+| **`Penrose Harness`** | **Manifold Bus & OS Scheduler**<br>(`penrose_harness.py`) | **MMU + DMA 预取器 + 外围 I/O 换能总线** | 外置 **$2048 = 8 \times 256$ 沃尔什-阿达玛（Walsh-Hadamard）正交谐波全息波包换能器**（0 参数）與**双层负散度漏斗流式切分器**；管控 Module 5 出口的**硬件级三态总线分支（分支 A/B/C）**、早一轮白盒流线预取与自治森林六算子演化（`Auto-Mitosis / Closure / Expand / Split / Merge / Spawn`）。 |
 
 ---
 
@@ -88,7 +89,7 @@ python train_penrose_v1.py --steps 20
 1. **核心机制代码（`GNU AGPL-3.0`）**：
    - 本仓库中的 **`MPU`（`penrose_mpu.py`）**、**`PMC` 流形管理引擎（`penrose_pmc.py`）**、**`Penrose Harness` 外围换能与调度总线（`penrose_harness.py`）**、**`bkp_manager.py`** 及相关训练/验证脚本均遵循 **[GNU Affero General Public License v3.0 (AGPL-3.0)](https://www.gnu.org/licenses/agpl-3.0.html)** 协议开源。
    - 任何基于本架构代码的修改、衍生开发或通过网络对外提供推理/计算服务的部署，均须遵循 AGPL-3.0 协议要求完整公开相应源代码。
-2. **训练生成的 `.pmc` 流形记忆包文件（`CC-BY-SA 4.0`）**：
-   - 所有通过本架构训练、拖拽蒸馏或自治演化结晶生成的 **`.pmc`（Penrose Manifold Cartridge）流形文件**均遵循 **[Creative Commons Attribution-ShareAlike 4.0 International (CC-BY-SA 4.0，知识共享 署名-相同方式共享 4.0 国际许可协议)](https://creativecommons.org/licenses/by-sa/4.0/)**。
-   - 允许在保留署名（Attribution）的前提下自由共享、挂载、合并（`Auto-Merge`）、分裂（`Auto-Split`）或再演绎 `.pmc` 流形包，但任何基于该 `.pmc` 衍生、微调或混合重构出的新 `.pmc` 文件必须以相同的 **CC-BY-SA 4.0** 协议进行分发。
+2. **训练生成的 `.pmc` 流形记忆块文件（`CC-BY-SA 4.0`）**：
+   - 所有通过本架构训练、拖拽蒸馏或自治演化结晶生成的 **`.pmc`（Penrose Manifold Chunk）流形文件**均遵循 **[Creative Commons Attribution-ShareAlike 4.0 International (CC-BY-SA 4.0，知识共享 署名-相同方式共享 4.0 国际许可协议)](https://creativecommons.org/licenses/by-sa/4.0/)**。
+   - 允许在保留署名（Attribution）的前提下自由共享、挂载、合并（`Auto-Merge`）、分裂（`Auto-Split`）或再演绎 `.pmc` 流形块，但任何基于该 `.pmc` 衍生、微调或混合重构出的新 `.pmc` 文件必须以相同的 **CC-BY-SA 4.0** 协议进行分发。
 

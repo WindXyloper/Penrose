@@ -1,7 +1,11 @@
 """
-Penrose v1.0 — PMC (Penrose Manifold Cartridge, `.pmc` / `.bkp`)
-================================================================
-基于十条零超参数闭式物理公理的同质微专家黎曼流形块管理引擎。
+Penrose v1.0 — PMC (Penrose Manifold Chunk, `.pmc` / `.bkp`)
+============================================================
+基于十条零超参数闭式物理公理的同质微专家黎曼流形图册（Atlas）管理引擎：
+- 全宇宙共享唯一的 2048 维母体单位超球面 S^2047；
+- 每一个 4KB 微专家 (u_m, v_m) 是钉在 S^2047 上的嘉当活动标架（Cartan Moving Frame）；
+- 每一个 `.pmc` 是贴合在母体超球面特定区域上的自适应分辨率局部坐标卡（Local Coordinate Chart）；
+- `BridgeAB.pmc` 是连接不同流形板块的测地线联络桥（Transition Bundle），承载霍奇分解的第三极：拓扑调和虫洞场 H^1(M)。
 """
 
 import math
@@ -38,13 +42,15 @@ PMC_MAGIC: bytes = b"PMC2048\x00"
 @dataclass
 class HelmholtzFieldDiagnostics:
     """
-    PMC 流形场在当前球面状态 q(tau) 处的实时微分几何诊断量（驱动 Module 5 三态总线分支）：
-    - delta_pmc       : (B, T, 2048) 流形场合成切向推力 V_PMC(q)
+    PMC 流形图册在当前球面状态 q(tau) 处的实时霍奇三分解微分几何诊断量（驱动 Module 5 三态总线分支）：
+      V|_M = V_div (负散度数据汇) (+) V_curl (局部无散旋度流) (+) H^1(M) (拓扑调和虫洞/联络桥流)
+    - delta_pmc       : (B, T, 2048) 流形图册合成切向推力 V_PMC(q)
     - div_v           : (B, T) 局部散度 Tr(J_local) = sum_m w_m <u_m, v_m>
-    - eta_curl        : (B, T) 局部归一化旋度能量比 in [0, 1]
+    - eta_curl        : (B, T) 局部切向旋度能量比 in [0, 1]
     - active_experts  : (B, T, K_active) 当前步唤醒的微专家全局页索引
-    - active_weights  : (B, T, K_active) 对应的 L2 守恒路由权重 w_m(q)
+    - active_weights  : (B, T, K_active) 对应的球面 L2 单位分解权重 w_m(q)
     - max_resonance   : (B, T) 最大微专家共振内积峰值
+    - eta_harmonic    : Optional[(B, T)] 霍奇分解第三项 H^1(M)（来自 Bridge.pmc 联络桥与 1-柄虫洞）的能量占比
     """
     delta_pmc: torch.Tensor
     div_v: torch.Tensor
@@ -52,12 +58,13 @@ class HelmholtzFieldDiagnostics:
     active_experts: torch.Tensor
     active_weights: torch.Tensor
     max_resonance: torch.Tensor
+    eta_harmonic: Optional[torch.Tensor] = None
 
 
 class PMCPackage(BKPPackage):
     """
-    Penrose Manifold Cartridge (`.pmc`) 四叉树流形块实体。
-    100% 继承 BKPPackage 的 4KB 同质微专家页 `(u_m, v_m)` 与十条闭式公理算子，
+    Penrose Manifold Chunk (`.pmc`) 流形局部坐标卡与联络桥实体。
+    100% 继承 BKPPackage 的 4KB 同质微专家活动标架 `(u_m, v_m)` 与十条闭式公理算子，
     并扩展静态流线指针表 `stream_next_ptr` 与无 AdamW 罗德里格斯大圆旋转写入。
     """
 
@@ -339,7 +346,7 @@ class PMCPackage(BKPPackage):
 
 class PMCManager(BKPManager):
     """
-    Penrose Manifold Cartridge (`.pmc`) 流形块森林管理器。
+    Penrose Manifold Chunk (`.pmc`) 流形图册（Atlas）与联络桥管理器。
     """
 
     def __init__(
@@ -403,13 +410,46 @@ class PMCManager(BKPManager):
 
     def get_writable_package(self) -> Optional[PMCPackage]:
         for pkg in reversed(self.mounted_packages):
-            if pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE):
+            if not pkg.is_bridge_pkg and pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE):
                 if isinstance(pkg, PMCPackage):
                     return pkg
         for pkg in self.mounted_packages:
             if isinstance(pkg, PMCPackage):
                 return pkg
         return None
+
+    @torch.no_grad()
+    def select_resonant_writable_package(self, psi: torch.Tensor) -> Optional[PMCPackage]:
+        """
+        母体超球面 S^2047 局部坐标卡归属路由（Atlas Chart Resonance Routing）：
+        当流形图册中存在多张可写局部坐标卡（如 Auto-Split 产生的 SubA.pmc / SubB.pmc 或 Auto-Spawn 产生的新板块）时，
+        根据当前轨迹相空间态 psi 与各局部坐标卡码本的球面共振度，自动选择最匹配的 `.pmc` 坐标卡写入。
+        """
+        writable_charts: List[PMCPackage] = [
+            pkg for pkg in self.mounted_packages
+            if isinstance(pkg, PMCPackage)
+            and (not pkg.is_bridge_pkg)
+            and pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE)
+        ]
+        if len(writable_charts) == 0:
+            return self.get_writable_package()
+        if len(writable_charts) == 1:
+            return writable_charts[0]
+
+        psi_probe = psi.detach().float().reshape(-1, D_BKP)[:16]
+        psi_heads = F.normalize(psi_probe.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+        best_pkg = writable_charts[-1]
+        best_score = -1e9
+        for chart in writable_charts:
+            u_cb = F.normalize(chart.u_codebook.detach().float(), dim=-1)
+            v_cb = F.normalize(chart.v_codebook.detach().float(), dim=-1)
+            su_max = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 0, :], u_cb).amax(dim=-1).mean()
+            sv_max = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 1, :], v_cb).amax(dim=-1).mean()
+            score = float((0.5 * (su_max + sv_max)).item())
+            if score >= best_score:
+                best_score = score
+                best_pkg = chart
+        return best_pkg
 
     @torch.no_grad()
     def prefetch_along_geodesic_streamline(
@@ -440,7 +480,7 @@ class PMCManager(BKPManager):
                 if valid_next.numel() > 0:
                     eids_curr = torch.cat([eids_curr, valid_next]).unique()
 
-        self.prefetch_queue_eids.append((pkg.pkg_id, eids_curr))
+            self.prefetch_queue_eids.append((pkg.pkg_id, eids_curr))
         return self.prefetch_queue_eids
 
     @torch.no_grad()
@@ -516,40 +556,52 @@ class PMCManager(BKPManager):
                 active_experts=empty_idx,
                 active_weights=zero_scalar.unsqueeze(-1),
                 max_resonance=zero_scalar,
+                eta_harmonic=zero_scalar,
             )
 
         delta_pmc = self.query_and_inject(q_in)
 
         with torch.no_grad():
-            pkg = self.mounted_packages[-1]
             q_unit = F.normalize(q_flat.float(), dim=-1)
             q_heads = F.normalize(q_unit.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
 
             pkg_hit_masks: Dict[str, torch.Tensor] = {}
             global_max_res = torch.zeros(q_unit.size(0), device=dev, dtype=torch.float32)
-            for p_iter in self.mounted_packages:
-                cand_p = self._select_candidate_grid_subset(p_iter, q_heads, sub_top_m=8)
+            u_atlas_list: List[torch.Tensor] = []
+            v_atlas_list: List[torch.Tensor] = []
+            eids_atlas_list: List[torch.Tensor] = []
+            bridge_flag_list: List[torch.Tensor] = []
+
+            for p_idx, p_iter in enumerate(self.mounted_packages):
+                p_mask = puncture_expert_mask if (puncture_expert_mask is not None and p_iter is self.mounted_packages[-1]) else None
+                cand_p = self._select_candidate_grid_subset(
+                    p_iter, q_heads, sub_top_m=8, puncture_expert_mask=p_mask
+                )
                 if cand_p.numel() == 0:
                     continue
                 if isinstance(p_iter, PMCPackage):
-                    u_p, _ = p_iter.dequantize_expert_uv(cand_p)
+                    u_p, v_p = p_iter.dequantize_expert_uv(cand_p)
                 else:
                     u_p = p_iter.expert_pages_int8[cand_p.cpu(), 0].float().to(dev) * p_iter.scales[cand_p, 0:1].float()
+                    v_p = p_iter.expert_pages_int8[cand_p.cpu(), 1].float().to(dev) * p_iter.scales[cand_p, 1:2].float()
                 u_p_unit = F.normalize(u_p.to(dev), dim=-1)
+                v_p_dev = v_p.to(dev)
                 sim_p = torch.matmul(q_unit, u_p_unit.t())
                 max_p = sim_p.amax(dim=-1)
                 global_max_res = torch.maximum(global_max_res, max_p)
                 pkg_hit_masks[p_iter.pkg_id] = max_p >= SIMPLEX_3_BARYCENTER_PROJ * 0.50
 
+                u_atlas_list.append(u_p_unit)
+                v_atlas_list.append(v_p_dev)
+                eid_offset = 0 if len(self.mounted_packages) == 1 else (p_idx << 20)
+                eids_atlas_list.append(cand_p + eid_offset)
+                bridge_flag_list.append(
+                    torch.full((cand_p.numel(),), bool(p_iter.is_bridge_pkg), dtype=torch.bool, device=dev)
+                )
+
             self._record_manifold_telemetry(q_unit, pkg_hit_masks, global_max_res)
 
-            cand_eids = self._select_candidate_grid_subset(
-                pkg,
-                q_heads,
-                sub_top_m=8,
-                puncture_expert_mask=puncture_expert_mask,
-            )
-            if cand_eids.numel() == 0:
+            if len(u_atlas_list) == 0:
                 zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
                 empty_idx = torch.zeros((B, T, 1), device=dev, dtype=torch.long)
                 return HelmholtzFieldDiagnostics(
@@ -559,14 +611,13 @@ class PMCManager(BKPManager):
                     active_experts=empty_idx,
                     active_weights=zero_scalar.unsqueeze(-1),
                     max_resonance=zero_scalar,
+                    eta_harmonic=zero_scalar,
                 )
 
-            if isinstance(pkg, PMCPackage):
-                u_all, v_all = pkg.dequantize_expert_uv(cand_eids)
-            else:
-                u_all = pkg.expert_pages_int8[cand_eids.cpu(), 0].float().to(dev) * pkg.scales[cand_eids, 0:1].float()
-                v_all = pkg.expert_pages_int8[cand_eids.cpu(), 1].float().to(dev) * pkg.scales[cand_eids, 1:2].float()
-            u_unit = F.normalize(u_all, dim=-1)
+            u_unit = torch.cat(u_atlas_list, dim=0)
+            v_all = torch.cat(v_atlas_list, dim=0)
+            cand_eids = torch.cat(eids_atlas_list, dim=0)
+            is_bridge_all = torch.cat(bridge_flag_list, dim=0)
 
             sim = torch.matmul(q_unit, u_unit.t())
             if puncture_dropout_prob > 0.0:
@@ -586,13 +637,14 @@ class PMCManager(BKPManager):
 
             u_sel = u_unit[top_rel_idx]
             v_sel = v_all[top_rel_idx]
+            bridge_sel = is_bridge_all[top_rel_idx].float()
 
             res_envelope = top_sim.clamp(0.0, 1.0).pow(2)
             interp_field = torch.sum((w_l2 * res_envelope).unsqueeze(-1) * v_sel, dim=1).view(orig_shape)
             if puncture_expert_mask is not None or puncture_dropout_prob > 0.0:
                 delta_pmc = interp_field.to(q_in.dtype)
             else:
-                # 零 .item() 同步阻塞：纯张量掩码融合 query_and_inject 与局部单纯形插值场
+                # 零 .item() 同步阻塞：纯张量掩码融合 query_and_inject 与全图册单纯形插值场
                 is_zero_inject = delta_pmc.abs().amax(dim=-1, keepdim=True) <= 1e-6
                 blended = (0.5 * delta_pmc.float() + 0.5 * interp_field).to(q_in.dtype)
                 delta_pmc = torch.where(is_zero_inject, interp_field.to(q_in.dtype), blended)
@@ -603,6 +655,9 @@ class PMCManager(BKPManager):
             div_local = (w_l2 * res_envelope * uv_dot).sum(dim=-1)
             eta_div_local = ((w_l2 * w_l2) * (cos_uv * cos_uv)).sum(dim=-1).clamp(0.0, 1.0)
             eta_curl_local = 1.0 - eta_div_local
+            v_perp_norm = (v_sel - uv_dot.unsqueeze(-1) * u_sel).norm(dim=-1)
+            is_wormhole = ((bridge_sel > 0.5) | (v_perp_norm > 1.8)).float()
+            eta_harm_local = ((w_l2 * w_l2) * is_wormhole).sum(dim=-1).clamp(0.0, 1.0)
 
         return HelmholtzFieldDiagnostics(
             delta_pmc=delta_pmc,
@@ -611,6 +666,7 @@ class PMCManager(BKPManager):
             active_experts=top_eids.view(B, T, k_top),
             active_weights=w_l2.view(B, T, k_top),
             max_resonance=max_res.view(B, T),
+            eta_harmonic=eta_harm_local.view(B, T),
         )
 
     @torch.no_grad()
@@ -624,11 +680,8 @@ class PMCManager(BKPManager):
     ) -> Dict[str, Any]:
         """
         Penrose v1.0 核心创新：彻底废除 AdamW 的「Kaczmarz 单纯形正交投影 + 罗德里格斯大圆旋转」一步闭式更新器。
+        支持母体超球面 S^2047 多坐标卡图册自适应归属路由（Atlas Chart Resonance Routing）。
         """
-        pkg = self.get_writable_package()
-        if pkg is None:
-            return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0}
-
         q_c = F.normalize(q_curr.detach().float().reshape(-1, D_BKP), dim=-1)
         q_p = F.normalize(q_prev.detach().float().reshape(-1, D_BKP), dim=-1)
         q_t = F.normalize(q_target.detach().float().reshape(-1, D_BKP), dim=-1)
@@ -644,6 +697,10 @@ class PMCManager(BKPManager):
             + (1.0 - has_tangent) * (1.0 - JET_NORMAL_ALPHA_STAR) * q_c,
             dim=-1,
         )
+
+        pkg = self.select_resonant_writable_package(psi)
+        if pkg is None:
+            return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0}
 
         v_tan = q_t - (q_t * q_c).sum(dim=-1, keepdim=True) * q_c
         # 法向负散度分量 (-0.65 * q_c) 控制散度门控 (div V < 0)，

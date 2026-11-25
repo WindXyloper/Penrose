@@ -315,13 +315,22 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     assert pkg.grid_k == 128 and expand_zero_err < 1e-6
     assert int(pkg.stream_next_ptr[0, 0].item()) == 129, f"流线指针扩容重映射错误: {pkg.stream_next_ptr[0]}"
 
-    # 构造双簇激活触发 Auto-Split (128 -> SubA + SubB)
+    # 构造双簇激活触发 Auto-Split (128 -> SubA + SubB + BridgeAB)
     pkg.activation_counts.zero_()
     pkg.activation_counts.view(128, 128)[:16, :16] = 10
     pkg.activation_counts.view(128, 128)[64:80, 64:80] = 10
+    # 写入一个跨簇非对角桥接微专家 (row=0, col=64 -> eid=64)，使 Auto-Split 同时抽取出联络桥 BridgeAB.pmc
+    pkg.quantize_write_expert_page(64, q_a, q_b * 6.0, hit_increment=2.0, purity_val=0.95)
     ev_split = mgr.step_autonomous_forest_evolution(step=2, q_probe=q_probe)
     assert any(e["op"] == "Auto-Split" for e in ev_split)
     assert all(isinstance(p, PMCPackage) for p in mgr.mounted_packages)
+    assert any(p.is_bridge_pkg for p in mgr.mounted_packages), "Auto-Split 应当抽取出跨板块联络桥 BridgeAB.pmc！"
+
+    # 验证多坐标卡图册（SubA + SubB + BridgeAB）联合单纯形查询、霍奇第三项 eta_harmonic 与母体超球面共振归属路由
+    diag_atlas = mgr.query_with_helmholtz_diagnostics(q_probe)
+    assert diag_atlas.eta_harmonic is not None and float(diag_atlas.eta_harmonic.max().item()) > 0.0
+    routed_chart = mgr.select_resonant_writable_package(q_a)
+    assert isinstance(routed_chart, PMCPackage) and (not routed_chart.is_bridge_pkg)
 
     # 构造跨包共激活触发 Auto-Merge (SubA + SubB -> TriadicMerge)
     pids = [p.pkg_id for p in mgr.mounted_packages if not p.is_bridge_pkg]
@@ -344,7 +353,8 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     assert all(isinstance(p, PMCPackage) for p in mgr.mounted_packages)
 
     # 2. 验证回流验证后的思考语料通过统一训练接口形成「拓扑虫洞道岔」（保留原推导路径 + 架设直达虫洞）
-    harness = PenroseHarness(auto_evolve_interval=10, device=device)
+    mpu_fast = PenroseMPU(PenroseMPUConfig.preset_penrose_agile_12l()).to(device)
+    harness = PenroseHarness(mpu=mpu_fast, auto_evolve_interval=10, device=device)
     cot_chain = "问题起点 推导一 推导二 最终真值"
     wormhole_pair = "问题起点 最终真值"
     r_cot = harness.train_manifold_trajectory(cot_chain, snap_rate=1.0, enable_auto_mitosis=True)
@@ -356,6 +366,8 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
         "all_packages_are_pmc": all(isinstance(p, PMCPackage) for p in mgr.mounted_packages),
         "stream_ptr_remapped_eid": int(pkg.stream_next_ptr[0, 0].item()),
         "expand_zero_step_err": round(expand_zero_err, 8),
+        "eta_harmonic_max": round(float(diag_atlas.eta_harmonic.max().item()), 6),
+        "routed_chart_id": routed_chart.pkg_id,
         "operator_totals": snap["operator_totals"],
         "wormhole_mitosis_switches": r_wormhole["kaczmarz_stats"]["mitosis_pages"],
     }
