@@ -9,16 +9,30 @@
 
 ---
 
-## 一、 架构总览与七步第一性原理
+## 一、 架构总览与七步第一性原理（为什么 Penrose 能够存在）
 
-> **Penrose 第一性原理全景**：任何自洽的信息系统皆内禀一个微分流形 $\mathcal{M}^k$；通过零参数沃尔什-阿达玛全息换能器 $\mathbf{H}_8 \otimes \mathbf{H}_{256}$ 与纳什高余维等距嵌入，万物皆无损嵌入于同一个 **2048 维母体单位超球面 $\mathbb{S}^{2047}$**；每个 4KB 微专家 $(u_m, v_m)$ 是钉在母体超球面上的**嘉当活动标架（Cartan Moving Frame）**；每个 `.pmc`（**Penrose Manifold Chunk**）是贴合在母体超球面特定区域上的**自适应分辨率局部坐标卡（Local Coordinate Chart）**，而 `BridgeAB.pmc` 则是跨板块跃迁的**测地线联络桥（Transition Bundle）**，与数据微专家、指令微专家共同构成霍奇分解定理（Hodge Decomposition）的三大正交极：
-> $$\mathbf{V}\big|_{\mathcal{M}} = \underbrace{\mathbf{V}_{\text{div}}}_{\text{数据微专家 }(\operatorname{div}<0)} \;\oplus\; \underbrace{\mathbf{V}_{\text{curl}}}_{\text{指令微专家 }(\operatorname{curl}\neq 0)} \;\oplus\; \underbrace{\mathcal{H}^1(\mathcal{M})}_{\text{拓扑调和虫洞场 / Bridge.pmc }\big(\dim\mathcal{H}^1(\mathcal{M}) = b_1(\mathcal{M})\big)}$$
+**`Penrose v1.0`** 彻底终结了传统大语言模型将计算内核死绑在几万行静态词表（`nn.Embedding` 与 `LM Head Softmax`）以及海量优化器状态（`AdamW` $m_t, v_t$）上的旧范式。其全部物理与数学合法性建立在以下**七步第一性原理推导链**之上：
+
+1. **第一性原理 1（内禀流形公理）**：任何自洽的信息系统（自然语言、形式数学、计算机代码、物理定律）都不是杂乱无章的离散词表，而是受局部语法与全局逻辑共同约束的**低维内禀微分流形 $\mathcal{M}^k$**（内禀维数 $k \ll 2048$）。
+2. **第一性原理 2（母体超球面等距嵌入公理）**：通过零参数的 **$2048 = 8 \times 256$ 沃尔什-阿达玛（Walsh-Hadamard）正交全息换能器 $\mathbf{H}_8 \otimes \mathbf{H}_{256}$** 与纳什高余维等距嵌入定理（Nash Isometric Embedding），任意领域的内禀流形 $\mathcal{M}^k$ 皆被无损嵌入到**全宇宙唯一共享的 2048 维母体单位超球面 $\mathbb{S}^{2047} \subset \mathbb{R}^{2048}$** 之中：
+   $$\mathcal{M}^k \xhookrightarrow{\quad \iota \quad} \mathbb{S}^{2047}, \qquad T_q\mathbb{S}^{2047} = \underbrace{T_q\mathcal{M}^k}_{\text{内禀切空间 }(k\text{ 维})} \;\oplus\; \underbrace{N_q\mathcal{M}^k}_{\text{法向余维体空间 }(2047-k\text{ 维})}$$
+3. **第一性原理 3（嘉当活动标架与空间曲率自适应粒度）**：每一个 4KB 微专家页 $(u_m, v_m) \in \mathbb{R}^{2 \times 2048}$ 是钉在母体超球面 $\mathbb{S}^{2047}$ 上的**嘉当活动标架（Cartan Moving Frame）**——$u_m$ 指向流形特征点并编码 1-Jet 入射朝向，尽头的 $v_m$ 同时提供法向负散度汇点引力（将偏离轨迹拉回 $\mathcal{M}^k$）与切平面推力（驱动状态沿流形前进）。
+   - **为什么微专家无需存储额外的“粒度标量”**：所有微专家保持 **100% 物理同质**；流形的局部粒度完全由微专家在 $\mathbb{S}^{2047}$ 上的**空间排布密度与拓扑分裂**自然涌现——平滑低曲率区微专家稀疏分布，靠公理 6 的球面 $\ell_2$ 单位分解（$\sum_{m \in \text{Simplex}(q)} w_m^2(q) \equiv 1$）与三次厄米特 $C^1$ 插值即可精确还原流形表面；陡峭高曲率或逻辑分岔区则自动高频触发 **`Auto-Mitosis`（切向叶状分支）** 与 **`Auto-Expand`（四叉树加密）**，用高密度标架群精细刻画复杂拓扑。
+4. **第一性原理 4（`.pmc` 作为局部坐标卡 Local Coordinate Chart）**：每一个 **`.pmc`（Penrose Manifold Chunk，流形记忆块）** 并非各自孤立的“小宇宙”，而是贴合在唯一母体超球面 $\mathbb{S}^{2047}$ 特定区域 $U_\alpha \subset \mathbb{S}^{2047}$ 上的**自适应分辨率局部坐标卡 $(U_\alpha, \varphi_\alpha)$**（内部维护 $K_\alpha \times K_\alpha$ 双正交乘积子键网格）。
+5. **第一性原理 5（曲率奇点裂变与测地线联络桥 `BridgeAB.pmc`）**：当单个 `.pmc` 坐标卡覆盖的区域跨越两个差异显著的知识板块、导致曲率张量饱和时，**`Auto-Split`** 自动将其裂变为两张紧贴各自分流形的子坐标卡 **`SubA.pmc`** 与 **`SubB.pmc`**，并将跨板块跃迁的非对角微专家单独抽取为**测地线联络桥（Transition Bundle `BridgeAB.pmc`）**——其锚点 $u_{\text{bridge}} \in \partial U_A$ 钉在板块 A 出口，切向推力 $v_{\text{bridge},\perp}$ 精确指向板块 B 入口 $U_B$。
+6. **第一性原理 6（米尔诺 1-柄拓扑手术与霍奇正交三分解定理）**：当多步思考链（CoT）经真值校验通过并回流起点结晶出直达虫洞微专家（或生成跨板块 `BridgeAB.pmc`）时，其推力借道母体超球面的法向余维体空间 $N_q\mathcal{M}^k$，对知识子流形执行**米尔诺 1-柄粘合拓扑手术（Milnor 1-Handle Attachment）**，使子流形的第一贝蒂数（一维上同调维数）严格加 1：$b_1(\mathcal{M}_{\text{after}}) = b_1(\mathcal{M}_{\text{before}}) + 1$。由此，知识子流形上的向量场严格满足完备的**霍奇分解定理（Hodge Decomposition Theorem）**：
+   $$\mathbf{V}\big|_{\mathcal{M}} = \underbrace{\mathbf{V}_{\text{div}}}_{\substack{\text{数据微专家 }(\operatorname{div}<0) \\ \text{吸引盆汇点 / 事实锚点}}} \;\oplus\; \underbrace{\mathbf{V}_{\text{curl}}}_{\substack{\text{指令微专家 }(\operatorname{curl}\neq 0) \\ \text{局部盘山公路 / 步进推演流}}} \;\oplus\; \underbrace{\mathcal{H}^1(\mathcal{M})}_{\substack{\text{拓扑调和虫洞场 / Bridge.pmc} \\ \text{跨区域直达捷径 }\big(\dim\mathcal{H}^1(\mathcal{M}) = b_1(\mathcal{M})\big)}}$$
+7. **第一性原理 7（`MPU` 作为流形上的测地线微分方程积分器）**：既然知识与指令皆已编码为 `.pmc` 图册在 $\mathbb{S}^{2047}$ 上张成的三维正交向量场（$\mathbf{V}_{\text{div}} \oplus \mathbf{V}_{\text{curl}} \oplus \mathcal{H}^1(\mathcal{M})$），计算内核 **`MPU`（Manifold Processing Unit）** 就不再需要记忆静态事实，而纯粹退化为母体超球面上的**五段式高阶常微分方程（ODE）数值积分器**，驱动状态点 $q(\tau)$ 沿流形测地线精准滑行至 $q(\tau+1) \in \mathbb{S}^{2047}$。
+
+---
+
+### 三大核心部件总览
 
 | 核心组件 | 全称与代码模块 | 现代计算机对标 | 核心数学与物理职责 |
 | :--- | :--- | :--- | :--- |
 | **`MPU`** | **Manifold Processing Unit**<br>(`penrose_mpu.py`) | **CPU / 测地线微分方程积分器** | **0 词表参数**；严格实现「2048 维单位球面向量进 $\to$ 2048 维单位球面向量出」的五段式 12 层（8 注意力头）状态推进器：$q(\tau) \to q(\tau+1) \in \mathbb{S}^{2047}$。 |
 | **`PMC`** | **Penrose Manifold Chunk**<br>(`penrose_pmc.py`, `.pmc`) | **4KB 局部坐标卡图册 / 固态流形盘** | **100% 物理同质嘉当活动标架** $(u_m, v_m) \in \mathbb{R}^{2 \times 2048}$；在简单流形区稀疏分布并由球面 $\ell_2$ 单位分解平滑插值，在复杂高曲率区通过 `Auto-Mitosis`（叶状分支）与 `Auto-Split`（分流形 `SubA/SubB` + 联络桥 `BridgeAB`）自适应加密；采用 **0 字节优化器显存**的 Kaczmarz 正交投影与罗德里格斯大圆旋转一步锁死流形。 |
-| **`Penrose Harness`** | **Manifold Bus & OS Scheduler**<br>(`penrose_harness.py`) | **MMU + DMA 预取器 + 外围 I/O 换能总线** | 外置 **$2048 = 8 \times 256$ 沃尔什-阿达玛（Walsh-Hadamard）正交谐波全息波包换能器**（0 参数）與**双层负散度漏斗流式切分器**；管控 Module 5 出口的**硬件级三态总线分支（分支 A/B/C）**、早一轮白盒流线预取与自治森林六算子演化（`Auto-Mitosis / Closure / Expand / Split / Merge / Spawn`）。 |
+| **`Penrose Harness`** | **Manifold Bus & OS Scheduler**<br>(`penrose_harness.py`) | **MMU + DMA 预取器 + 外围 I/O 换能总线** | 外置 **$2048 = 8 \times 256$ 沃尔什-阿达玛（Walsh-Hadamard）正交谐波全息波包换能器**（0 参数）与**双层负散度漏斗流式切分器**；管控 Module 5 出口的**硬件级三态总线分支（分支 A/B/C）**、早一轮白盒流线预取与自治森林六算子演化（`Auto-Mitosis / Closure / Expand / Split / Merge / Spawn`）。 |
 
 ---
 
