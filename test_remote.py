@@ -207,10 +207,29 @@ def test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity() -> Dict[st
     step_clean = harness.step_tri_state_bus(q_clean, max_internal_curl_ticks=1)
     assert "{" not in step_clean["emitted_text"] and "text" not in step_clean["emitted_text"]
 
+    # 验证逆向拖拽擦除 (drag_and_drop_erase)：擦除 doc_2 后，doc_2 独占页触发公理 9 细胞凋亡、共享外壳剥离，而 doc_1 保持低损失
+    r_erase_doc2 = harness.drag_and_drop_erase(doc_2, erase_rate=1.0, eval_before_after=True)
+    assert r_erase_doc2["erase_stats"]["apoptosis_pages"] > 0, f"擦除独占文档应当触发公理 9 细胞凋亡: {r_erase_doc2}"
+    assert r_erase_doc2["erase_stats"]["peeled_shared_pages"] > 0, f"共用脏外壳微专家应当触发秩-1 正交剥离: {r_erase_doc2}"
+    assert r_erase_doc2["loss_after"] > 0.75, f"擦除后 doc_2 球面弦长误差应当精确回退至未学习基线 (~0.79): {r_erase_doc2}"
+
+    # 验证擦除 doc_2 对 doc_1 的记忆零损伤 (doc_1 球面弦长误差依然保持在 ~0.51，远低于初始 1.0022)
+    q_seq_1, _ = harness.transducer.segment_text_to_wavepackets(doc_1, pmc_manager=harness.pmc_manager)
+    q_c1 = q_seq_1[:-1].unsqueeze(0)
+    q_t1 = q_seq_1[1:].unsqueeze(0)
+    q_p1 = torch.cat([q_c1[:, :1, :], q_c1[:, :-1, :]], dim=1)
+    with torch.no_grad():
+        doc1_loss_retained = float(harness.mpu(q_c1, q_prev=q_p1, pmc_manager=harness.pmc_manager, q_target=q_t1).loss.item())
+    assert doc1_loss_retained < 0.55, f"擦除 doc_2 不应破坏共享流形中 doc_1 的记忆: {doc1_loss_retained}"
+
     res = {
         "pmc_optimizer_memory_bytes": 0,
         "doc1_loss_before_to_after": f"{r1['loss_before']:.4f} -> {r1['loss_after']:.4f}",
         "doc2_loss_before_to_after": f"{r2['loss_before']:.4f} -> {r2['loss_after']:.4f}",
+        "doc2_erase_loss_before_to_after": f"{r_erase_doc2['loss_before']:.4f} -> {r_erase_doc2['loss_after']:.4f}",
+        "doc1_loss_retained_after_doc2_erase": round(doc1_loss_retained, 4),
+        "erase_apoptosis_pages": r_erase_doc2["erase_stats"]["apoptosis_pages"],
+        "erase_peeled_shared_pages": r_erase_doc2["erase_stats"]["peeled_shared_pages"],
         "total_kaczmarz_snaps": r2["kaczmarz_stats"]["total_kaczmarz_snaps"],
         "total_mitosis_spawns": r2["kaczmarz_stats"]["total_mitosis_spawns"],
         "clean_query_json_leakage": False,

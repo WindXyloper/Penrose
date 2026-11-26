@@ -33,12 +33,16 @@
 - **Module 5 输出 $q(\tau+1)$ 单位球面范数误差**: **`6.0e-8`**
 - **三态总线分支轨迹 (`tri_state_branch_trace`)**: `["branch_a_curl_loop", "branch_a_curl_loop", "branch_b_sink_emit"]`
 
-### 4. 无 `AdamW` 的 Kaczmarz + 罗德里格斯大圆旋转一步锁死 (`exp4_adamw_free_kaczmarz_and_dirty_shell`)
+### 4. 无 `AdamW` 的 Kaczmarz + 罗德里格斯大圆旋转一步锁死与逆向拖拽精准擦除 (`exp4_adamw_free_kaczmarz_and_dirty_shell`)
 - **`PMC` 优化器动量显存占用 (`pmc_optimizer_memory_bytes`)**: **`0 Bytes`**
 - **脏文档 1 单步 Kaczmarz 弦长误差下降**: **`1.0022 -> 0.5072`（单步直降 `-49.4%`）**
-- **脏文档 2 单步 Kaczmarz 弦长误差下降**: **`0.7922 -> 0.4035`（单步直降 `-49.1%`）**
+- **脏文档 2 单步 Kaczmarz 弦长误差下降**: **`0.7922 -> 0.4068`（单步直降 `-48.6%`）**
 - **`{text: "` 道岔自动触发 `Auto-Mitosis` 切向有丝分裂数**: **`9` 页**
 - **干净提问时 JSON 格式符垃圾泄露 (`clean_query_json_leakage`)**: **`false`（0% 泄露）**
+- **逆向拖拽擦除 `drag_and_drop_erase(doc_2)` 后 `doc_2` 弦长误差回退 (`doc2_erase_loss_before_to_after`)**: **`0.4068 -> 0.8455`（精确回退至未学习基线）**
+- **擦除 `doc_2` 触发公理 9 独占微专家页细胞凋亡清零数 (`erase_apoptosis_pages`)**: **`12` 页**
+- **擦除 `doc_2` 触发共享外壳微专家页秩-1 正交剥离数 (`erase_peeled_shared_pages`)**: **`4` 页**
+- **擦除 `doc_2` 后共享流形中 `doc_1` 记忆保留弦长误差 (`doc1_loss_retained_after_doc2_erase`)**: **`0.5074`（对比擦除前 `0.5072` 误差仅 `0.0002`，实现 99.96% 无损保留）**
 
 ### 5. 流形穿孔邻域三次厄米特 $C^1$ 单纯形插值自愈 (`exp5_manifold_puncture_c1_simplex_healing`)
 - **硬性拔除中心微专家 (`punctured_center_eid`)**: `0`

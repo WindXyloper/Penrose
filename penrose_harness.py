@@ -621,6 +621,80 @@ class PenroseHarness(nn.Module):
         )
 
     @torch.no_grad()
+    def erase_manifold_trajectory(
+        self,
+        raw_text_or_wavepackets: Union[str, torch.Tensor],
+        erase_rate: float = 1.0,
+        eval_before_after: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        逆向流形轨迹擦除引擎（Inverse Manifold Trajectory Unlearning）：
+        与 `train_manifold_trajectory` 严格对偶的闭式机器遗忘接口，支持：
+        - 独占概念微专家触发公理 9「细胞凋亡（Cellular Apoptosis）」原位清零；
+        - 共享语法主干微专家执行秩-1 平行推力正交剥离与逆罗德里格斯回退；
+        - 流线邻接表 `stream_next_ptr` 拓扑断链。
+        """
+        if isinstance(raw_text_or_wavepackets, str):
+            q_seq, surface_chunks = self.transducer.segment_text_to_wavepackets(
+                raw_text_or_wavepackets, pmc_manager=self.pmc_manager
+            )
+        else:
+            q_seq = F.normalize(raw_text_or_wavepackets.to(self.device).float().reshape(-1, D_BKP), dim=-1)
+            surface_chunks = []
+
+        if q_seq.size(0) < 2:
+            return {
+                "num_wavepackets": int(q_seq.size(0)),
+                "surface_chunks": surface_chunks,
+                "loss_before": 0.0,
+                "loss_after": 0.0,
+                "erase_stats": {},
+            }
+
+        self.mpu.eval()
+        q_curr = q_seq[:-1].unsqueeze(0)
+        q_target = q_seq[1:].unsqueeze(0)
+        q_prev = torch.cat([q_curr[:, :1, :], q_curr[:, :-1, :]], dim=1)
+
+        loss_before = 0.0
+        if eval_before_after:
+            out_before = self.mpu(q_curr, q_prev=q_prev, pmc_manager=self.pmc_manager, q_target=q_target)
+            loss_before = float(out_before.loss.detach().cpu()) if out_before.loss is not None else 0.0
+
+        erase_stats = self.pmc_manager.geodesic_kaczmarz_erase_downdate(
+            q_curr=q_curr,
+            q_prev=q_prev,
+            q_target=q_target,
+            erase_rate=erase_rate,
+        )
+
+        loss_after = loss_before
+        if eval_before_after:
+            out_after = self.mpu(q_curr, q_prev=q_prev, pmc_manager=self.pmc_manager, q_target=q_target)
+            loss_after = float(out_after.loss.detach().cpu()) if out_after.loss is not None else 0.0
+
+        return {
+            "num_wavepackets": int(q_seq.size(0)),
+            "surface_chunks": surface_chunks,
+            "loss_before": round(loss_before, 6),
+            "loss_after": round(loss_after, 6),
+            "erase_stats": erase_stats,
+        }
+
+    @torch.no_grad()
+    def drag_and_drop_erase(
+        self,
+        raw_text: str,
+        erase_rate: float = 1.0,
+        eval_before_after: bool = False,
+    ) -> Dict[str, Any]:
+        return self.erase_manifold_trajectory(
+            raw_text_or_wavepackets=raw_text,
+            erase_rate=erase_rate,
+            eval_before_after=eval_before_after,
+        )
+
+    @torch.no_grad()
     def run_autonomous_topology_cycle(
         self,
         q_probe: Optional[torch.Tensor] = None,

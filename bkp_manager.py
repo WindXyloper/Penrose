@@ -2458,7 +2458,11 @@ class BKPManager(nn.Module):
             tau_z_eff = closed_form_gumbel_threshold(n_grid_eff)
 
         tau_z_sub = tau_z_eff if isinstance(tau_z_eff, float) else tau_z_eff
-        is_pkg_rw_train = self.training and pkg.mount_mode in (BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE)
+        is_pkg_rw_train = (
+            self.training
+            and torch.is_grad_enabled()
+            and pkg.mount_mode in (BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE)
+        )
 
         if pkg.is_bridge_pkg:
             return self._route_tile_block(
@@ -2870,8 +2874,10 @@ class BKPManager(nn.Module):
                 self.last_pkg_slot_hits[pkg.pkg_id] = int(local_eids.numel())
                 self.last_pkg_weight_sum[pkg.pkg_id] = float(local_weights.detach().float().sum().item())
 
-            is_pkg_trainable = self.training and pkg.mount_mode in (
-                BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE
+            is_pkg_trainable = (
+                self.training
+                and torch.is_grad_enabled()
+                and pkg.mount_mode in (BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE)
             )
 
             # 按微专家页号去重 (Multi-Head Consensus Deduplication)，同一微专家在单步内仅从缓存拉取一次

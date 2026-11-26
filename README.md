@@ -81,6 +81,10 @@
    - **分支 A（内部旋度闭环 / 隐式思考）**：当 $\operatorname{div}\mathbf{V} \approx 0, \eta_{\text{curl}} \to 1$ 时，$q(\tau+1)$ 不经过解码器，直接经内部高速旁路跳回 Module 1 连续推进；
    - **分支 B（外部负散度坍缩 / 符号吐出）**：当 $\operatorname{div}\mathbf{V} < 0$（落入概念汇点）时，由外围总线执行逆阿达玛变换吐出 UTF-8 字节流；
    - **分支 C（球面 ResNet 并行训练态）**：训练期完全不执行解码，直接在 Module 5 出口计算球面弦长误差 $\mathcal{L}_{\text{Penrose}}(\tau) = 1 - \langle q(\tau+1), q^*(\tau+1)\rangle$。
+4. **公理 9 & 10 闭式逆向流形擦除算子（`drag_and_drop_erase` / `geodesic_kaczmarz_erase_downdate`）**：
+   - 正向拖拽学习（`drag_and_drop_ingest`）与逆向拖拽遗忘（`drag_and_drop_erase`）构成流形记忆的正逆对偶群算子：
+     - **独占微专家页（公理 9 细胞凋亡）**：当目标轨迹对应的微专家页残余有效样本计数 $h_{\text{rem}} = h_{\text{old}} - \eta_{\text{erase}}\Delta h \le 0$ 时，执行 `apoptosis_expert_pages` 将其 INT8 载荷、FP16 缩放与流线边 100% 物理归零，并将同行/同列子键码本重锚定至剩余存活微专家的页内键重心；
+     - **共享微专家页（公理 10 秩-1 正交剥离）**：当该微专家页同时承载其他文档的公共知识（$h_{\text{rem}} > 0$，如共享的语法或前缀道岔）时，按逆向样本权重 $\beta = \min(\eta_{\text{erase}}\Delta h / h_{\text{old}}, 1 - \frac{1}{\sqrt{d_h}})$ 从载荷 $v_{\text{old}}$ 中剥离平行于待擦除轨迹的分量，并按反向角 $-\beta\theta$ 执行逆向 Rodrigues 测地旋转与流线熔断（`sever_streamline_transition`），在彻底抹除目标轨迹的同时对共存文档记忆实现零连带损伤。
 
 ---
 

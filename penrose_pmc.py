@@ -311,6 +311,58 @@ class PMCPackage(BKPPackage):
             self.stream_next_ptr[idx_u] = shifted
 
     @torch.no_grad()
+    def sever_streamline_transition(
+        self,
+        curr_eids: torch.Tensor,
+        next_eids: torch.Tensor,
+    ) -> int:
+        """
+        对偶流线表拓扑断链算子（Streamline Topological Severing）：
+        将 `stream_next_ptr[curr_eids]` 中指向 `next_eids` 的有向因果边重置为 `-1`，
+        阻断沿被擦除轨迹的 L2 -> L1 测地流线预取。
+        """
+        if curr_eids.numel() == 0 or next_eids.numel() == 0:
+            return 0
+        c_flat = curr_eids.reshape(-1).to(torch.long)
+        n_flat = next_eids.reshape(-1).to(torch.int32)
+        valid = (c_flat >= 0) & (c_flat < self.num_experts) & (n_flat >= 0) & (n_flat < self.num_experts)
+        if not bool(valid.any()):
+            return 0
+        c_valid = c_flat[valid]
+        n_valid = n_flat[valid]
+        cur_slots = self.stream_next_ptr[c_valid]
+        match_mask = cur_slots == n_valid.unsqueeze(-1)
+        severed_cnt = int(match_mask.sum().item())
+        if severed_cnt > 0:
+            self.stream_next_ptr[c_valid] = torch.where(
+                match_mask,
+                torch.full_like(cur_slots, -1),
+                cur_slots,
+            )
+        return severed_cnt
+
+    @torch.no_grad()
+    def apoptosis_expert_pages(self, eids: torch.Tensor) -> int:
+        """
+        公理 9 细胞凋亡算子（Cellular Apoptosis）：
+        当独占微专家的激活计数回退归零时，原位清零其 4KB Int8 页、缩放因子、激活计数、
+        纯度与流线邻接表，释放网格槽位供后续有丝分裂或新概念复用。
+        """
+        if eids.numel() == 0:
+            return 0
+        dev_ids = eids.reshape(-1).to(self.scales.device).long()
+        cpu_ids = dev_ids.detach().cpu()
+        self.expert_pages_int8[cpu_ids] = 0
+        if getattr(self, "_expert_pages_dev", None) is not None:
+            self._expert_pages_dev[dev_ids.to(self._expert_pages_dev.device)] = 0
+        self.scales[dev_ids] = 0.0
+        self.activation_counts[dev_ids] = 0
+        self.purity_r[dev_ids] = 1.0
+        self.stream_next_ptr[dev_ids] = -1
+        self._sparse_128_triblock_mode = None
+        return int(dev_ids.numel())
+
+    @torch.no_grad()
     def quantize_write_expert_page(
         self,
         eid: int,
@@ -619,6 +671,8 @@ class PMCManager(BKPManager):
             psi_bar = torch.where(has_intra_u.unsqueeze(-1), q_sphere_psi[first_occ], psi_bar)
             v_des_bar = torch.where(has_intra_u.unsqueeze(-1), v_desired[first_occ], v_des_bar)
             cos_v_u = F.cosine_similarity(v_old, v_des_bar, dim=-1)
+            # 主格点仅保留 first_occ 样本（其余句内分叉样本由 _apply_batched_mitosis_spawns 写入新列并计数）
+            hit_counts = torch.where(has_intra_u, torch.ones_like(hit_counts), hit_counts)
 
         existing_mitosis_u = enable_auto_mitosis & (~is_empty_u) & (cos_v_u < SIMPLEX_2_GEODESIC_PROJ)
         direct_update_u = ~existing_mitosis_u
@@ -706,7 +760,6 @@ class PMCManager(BKPManager):
             upd_psi_h = F.normalize(psi_d.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
             r_upd = torch.div(upd_eids, pkg.grid_k, rounding_mode="floor")
             c_upd = upd_eids % pkg.grid_k
-            # 空槽位首次写入时 step_fraction=1.0 直接对齐标准化子键，非空槽位按罗德里格斯步长同步旋转子键
             sf_sub = torch.where(upd_empty, torch.ones_like(h_m), step_frac.squeeze(-1)).view(1, -1, 1)
             u_cur_sub = F.normalize(pkg.u_codebook.data[:, r_upd, :].float(), dim=-1)
             v_cur_sub = F.normalize(pkg.v_codebook.data[:, c_upd, :].float(), dim=-1)
@@ -793,9 +846,7 @@ class PMCManager(BKPManager):
             pkg.activation_counts[target_eids] += 1
             pkg.purity_r[target_eids] = 1.0
             m_psi_h = F.normalize(m_psi.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
-            pkg.u_codebook.data[:, m_rows, :] = PMCPackage.rodrigues_geodesic_rotation(
-                pkg.u_codebook.data[:, m_rows, :], m_psi_h[:, :, 0, :].permute(1, 0, 2), step_fraction=1.0
-            )
+            # 有丝分裂复用已命中的行子键 m_rows（保持同行存量微专家的行寻址零漂移），仅将新分配的伴随空列 target_cols 对齐到分支右半子键
             pkg.v_codebook.data[:, target_cols, :] = PMCPackage.rodrigues_geodesic_rotation(
                 pkg.v_codebook.data[:, target_cols, :], m_psi_h[:, :, 1, :].permute(1, 0, 2), step_fraction=1.0
             )
@@ -811,6 +862,185 @@ class PMCManager(BKPManager):
             "mitosis_pages": int(mitosis_count),
             "total_kaczmarz_snaps": int(self.total_kaczmarz_snaps),
             "total_mitosis_spawns": int(self.total_mitosis_spawns),
+            "optimizer_memory_bytes": 0,
+        }
+
+    @torch.no_grad()
+    def geodesic_kaczmarz_erase_downdate(
+        self,
+        q_curr: torch.Tensor,
+        q_prev: torch.Tensor,
+        q_target: torch.Tensor,
+        erase_rate: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Penrose v1.0 逆向拖拽擦除算子（Geodesic Kaczmarz Inverse Downdate & Cellular Apoptosis）
+        """
+        q_c = F.normalize(q_curr.detach().float().reshape(-1, D_BKP), dim=-1)
+        q_p = F.normalize(q_prev.detach().float().reshape(-1, D_BKP), dim=-1)
+        q_t = F.normalize(q_target.detach().float().reshape(-1, D_BKP), dim=-1)
+        N = q_c.size(0)
+
+        dq = q_c - (q_c * q_p).sum(dim=-1, keepdim=True) * q_c
+        dq_norm = dq.norm(dim=-1, keepdim=True)
+        has_tangent = (dq_norm > 1e-5).float()
+        dq_unit = F.normalize(dq, dim=-1)
+        psi = F.normalize(
+            JET_NORMAL_ALPHA_STAR * q_c
+            + has_tangent * JET_TANGENT_NORM_STAR * dq_unit
+            + (1.0 - has_tangent) * (1.0 - JET_NORMAL_ALPHA_STAR) * q_c,
+            dim=-1,
+        )
+
+        pkg = self.select_resonant_writable_package(psi)
+        if pkg is None:
+            return {
+                "apoptosis_pages": 0,
+                "peeled_shared_pages": 0,
+                "severed_streamlines": 0,
+                "optimizer_memory_bytes": 0,
+            }
+
+        v_tan = q_t - (q_t * q_c).sum(dim=-1, keepdim=True) * q_c
+        v_erase = (1.0 / SIMPLEX_3_BARYCENTER_PROJ) * v_tan - SIMPLEX_3_BARYCENTER_PROJ * q_c
+
+        q1_psi, q2_psi = self._standardize_subqueries(psi, update_center=False)
+        u_cb, v_cb = pkg.normalized_codebooks()
+        su = torch.einsum("nhd,hkd->nhk", q1_psi.float(), u_cb.float()).mean(dim=1)
+        sv = torch.einsum("nhd,hkd->nhk", q2_psi.float(), v_cb.float()).mean(dim=1)
+        r_star = su.argmax(dim=-1)
+        c_star = sv.argmax(dim=-1)
+        eids = r_star * pkg.grid_k + c_star
+        return self._apply_batched_erase_downdate(pkg, r_star, eids, q1_psi, q2_psi, v_erase, erase_rate)
+
+    @torch.no_grad()
+    def _apply_batched_erase_downdate(
+        self,
+        pkg: PMCPackage,
+        r_star: torch.Tensor,
+        eids: torch.Tensor,
+        q1_psi: torch.Tensor,
+        q2_psi: torch.Tensor,
+        v_erase: torch.Tensor,
+        erase_rate: float,
+    ) -> Dict[str, Any]:
+        N = eids.size(0)
+        dev = eids.device
+        sv_2d = pkg.scales[:, 1].view(pkg.grid_k, pkg.grid_k)
+        for r_val in torch.unique(r_star):
+            r_int = int(r_val.item())
+            act_cols = torch.nonzero(sv_2d[r_int] > 1e-6, as_tuple=False).squeeze(-1)
+            if act_cols.numel() == 0:
+                eids[r_star == r_val] = -1
+                continue
+            row_eids = r_int * pkg.grid_k + act_cols
+            _, v_row = pkg.dequantize_expert_uv(row_eids)
+            tok_mask = r_star == r_val
+            v_er_sub = F.normalize(v_erase[tok_mask], dim=-1)
+            cos_mat = torch.matmul(v_er_sub, F.normalize(v_row, dim=-1).t())
+            best_cos, best_pos = cos_mat.max(dim=-1)
+            matched_eids = row_eids[best_pos]
+            eids[tok_mask] = torch.where(
+                best_cos >= SIMPLEX_3_BARYCENTER_PROJ,
+                matched_eids,
+                torch.full_like(matched_eids, -1),
+            )
+
+        severed_streamlines = 0
+        if N > 1:
+            diff_step = (eids[:-1] != eids[1:]) & (eids[:-1] >= 0) & (eids[1:] >= 0)
+            if bool(diff_step.any()):
+                severed_streamlines = pkg.sever_streamline_transition(eids[:-1][diff_step], eids[1:][diff_step])
+
+        valid_tok_mask = eids >= 0
+        if not bool(valid_tok_mask.any()):
+            return {
+                "apoptosis_pages": 0,
+                "peeled_shared_pages": 0,
+                "severed_streamlines": int(severed_streamlines),
+                "optimizer_memory_bytes": 0,
+            }
+
+        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
+        unique_eids, inverse_indices, hit_counts = torch.unique(
+            eids[valid_tok_mask], sorted=True, return_inverse=True, return_counts=True
+        )
+        u_cnt = int(unique_eids.numel())
+        psi_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
+        v_er_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
+        psi_sum.index_add_(0, inverse_indices, q_sphere_psi[valid_tok_mask])
+        v_er_sum.index_add_(0, inverse_indices, v_erase[valid_tok_mask])
+        inv_cnt = (1.0 / hit_counts.float()).unsqueeze(-1)
+        psi_bar = F.normalize(psi_sum * inv_cnt, dim=-1)
+        v_er_bar = v_er_sum * inv_cnt
+
+        h_old = pkg.activation_counts[unique_eids].float()
+        delta_h = hit_counts.float() * float(erase_rate)
+        apoptosis_mask = h_old <= delta_h + 1e-5
+        shared_mask = ~apoptosis_mask
+
+        apoptosis_cnt = 0
+        if bool(apoptosis_mask.any()):
+            apop_eids = unique_eids[apoptosis_mask]
+            apoptosis_cnt = pkg.apoptosis_expert_pages(apop_eids)
+            # 细胞凋亡后重锚定受影响行/列的子键码本至同行/同列剩余存活微专家的页内键重心，消除已擦除分支对存量微专家寻址的残余牵引
+            sv_after = pkg.scales[:, 1].view(pkg.grid_k, pkg.grid_k)
+            apop_rows = torch.unique(torch.div(apop_eids, pkg.grid_k, rounding_mode="floor"))
+            apop_cols = torch.unique(apop_eids % pkg.grid_k)
+            for r_v in apop_rows:
+                ri = int(r_v.item())
+                surv_c = torch.nonzero(sv_after[ri] > 1e-6, as_tuple=False).squeeze(-1)
+                if surv_c.numel() > 0:
+                    u_surv, _ = pkg.dequantize_expert_uv(ri * pkg.grid_k + surv_c)
+                    u_h = F.normalize(u_surv.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM).mean(dim=0), dim=-1)
+                    pkg.u_codebook.data[:, ri, :] = u_h[:, 0, :]
+            for c_v in apop_cols:
+                ci = int(c_v.item())
+                surv_r = torch.nonzero(sv_after[:, ci] > 1e-6, as_tuple=False).squeeze(-1)
+                if surv_r.numel() > 0:
+                    u_surv, _ = pkg.dequantize_expert_uv(surv_r * pkg.grid_k + ci)
+                    u_h = F.normalize(u_surv.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM).mean(dim=0), dim=-1)
+                    pkg.v_codebook.data[:, ci, :] = u_h[:, 1, :]
+            pkg._u_cb_norm_cache = None
+            pkg._v_cb_norm_cache = None
+        peeled_cnt = 0
+        if bool(shared_mask.any()):
+            sh_eids = unique_eids[shared_mask]
+            u_old_s, v_old_s = pkg.dequantize_expert_uv(sh_eids)
+            psi_s = psi_bar[shared_mask]
+            v_er_s = v_er_bar[shared_mask]
+            h_old_s = h_old[shared_mask]
+            dh_s = delta_h[shared_mask]
+
+            # 正向 Kaczmarz 的精确代数逆解：
+            # 1) 若共享微专家上 v_erase 与存量 v_old 高度同向 (cos >= sqrt(2/3)，如共用的语法/格式转移 { -> text)，
+            #    正向写入时残差 res_v = v_des - v_old == 0，仅增加了引用计数 H_m；故逆算子仅需回退计数 H_m -= dh_s，严禁削减主干模长！
+            # 2) 若共享微专家存在方向折中混合 (1/sqrt(3) <= cos < sqrt(2/3))，则按权重 alpha_peel 剥离偏转分量并保持原模长守恒。
+            v_old_norm = v_old_s.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            v_old_unit = v_old_s / v_old_norm
+            v_er_unit = F.normalize(v_er_s, dim=-1)
+            cos_ve = (v_old_unit * v_er_unit).sum(dim=-1, keepdim=True)
+            is_divergent_mix = (cos_ve < JET_NORMAL_ALPHA_STAR).float()
+            alpha_peel = (dh_s / h_old_s.clamp_min(1.0)).clamp(0.0, 1.0 - 1e-4).unsqueeze(-1) * is_divergent_mix
+
+            v_perp_er = v_er_unit - cos_ve * v_old_unit
+            v_peeled_dir = F.normalize(v_old_unit - alpha_peel * v_perp_er, dim=-1)
+            v_peeled = v_peeled_dir * v_old_norm
+
+            u_unit_old = F.normalize(u_old_s, dim=-1)
+            cos_th = (u_unit_old * psi_s).sum(dim=-1, keepdim=True).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            theta_back = -torch.acos(cos_th) * alpha_peel
+            w_perp = F.normalize(psi_s - cos_th * u_unit_old, dim=-1)
+            u_rev = F.normalize(torch.cos(theta_back) * u_unit_old + torch.sin(theta_back) * w_perp, dim=-1)
+            pkg.write_experts_to_mmap_pages(sh_eids, u_rev * math.sqrt(float(D_BKP)), v_peeled)
+            pkg.activation_counts[sh_eids] = (h_old_s - dh_s).clamp_min(1.0).round().to(pkg.activation_counts.dtype)
+            peeled_cnt = int(sh_eids.numel())
+
+        self.vram_cache.invalidate_or_refresh(pkg, unique_eids)
+        return {
+            "apoptosis_pages": int(apoptosis_cnt),
+            "peeled_shared_pages": int(peeled_cnt),
+            "severed_streamlines": int(severed_streamlines),
             "optimizer_memory_bytes": 0,
         }
 
