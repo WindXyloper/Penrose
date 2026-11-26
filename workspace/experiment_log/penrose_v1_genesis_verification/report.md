@@ -28,23 +28,23 @@
 ### 3. `MPU` 五段式纯球面流水线与三态总线分支 (`exp3_mpu_five_module_and_tri_state_bus`)
 - **静态词表大小 (`vocab_size`)**: **`0`**
 - **流水线拓扑**: Module 1 (1-Jet Ingress) $\to$ Module 2 (前 6 层 8 头割线积分栈) $\to$ Module 3 (腰部 `PMC` 单位残差门) $\to$ Module 4 (后 6 层 8 头曲率精炼栈) $\to$ Module 5 (跨核球面 ResNet 切空间正交闭环)
-- **Module 1 $\psi^{(0)}(\tau)$ 单位球面范数误差**: **`6.0e-8`**（并在第 0 微秒自动触发异步预取 **`24`** 个微专家页）
-- **Module 5 切空间正交化误差 $\langle \Delta q_\perp(\tau), q(\tau)\rangle$**: **`1.5e-7`**
+- **Module 1 $\psi^{(0)}(\tau)$ 单位球面范数误差**: **`6.0e-8`**（并在第 0 微秒自动触发异步预取 **`23`** 个微专家页）
+- **Module 5 切空间正交化误差 $\langle \Delta q_\perp(\tau), q(\tau)\rangle$**: **`2.3e-7`**
 - **Module 5 输出 $q(\tau+1)$ 单位球面范数误差**: **`6.0e-8`**
 - **三态总线分支轨迹 (`tri_state_branch_trace`)**: `["branch_a_curl_loop", "branch_a_curl_loop", "branch_b_sink_emit"]`
 
 ### 4. 无 `AdamW` 的 Kaczmarz + 罗德里格斯大圆旋转一步锁死 (`exp4_adamw_free_kaczmarz_and_dirty_shell`)
 - **`PMC` 优化器动量显存占用 (`pmc_optimizer_memory_bytes`)**: **`0 Bytes`**
-- **脏文档 1 单步 Kaczmarz 弦长误差下降**: **`0.9905 -> 0.3584`（单步直降 `-63.8%`）**
-- **脏文档 2 单步 Kaczmarz 弦长误差下降**: **`0.8473 -> 0.5077`（单步直降 `-40.1%`）**
-- **`{text: "` 道岔自动触发 `Auto-Mitosis` 切向有丝分裂数**: **`12` 页**
+- **脏文档 1 单步 Kaczmarz 弦长误差下降**: **`1.0022 -> 0.5072`（单步直降 `-49.4%`）**
+- **脏文档 2 单步 Kaczmarz 弦长误差下降**: **`0.7922 -> 0.4035`（单步直降 `-49.1%`）**
+- **`{text: "` 道岔自动触发 `Auto-Mitosis` 切向有丝分裂数**: **`9` 页**
 - **干净提问时 JSON 格式符垃圾泄露 (`clean_query_json_leakage`)**: **`false`（0% 泄露）**
 
 ### 5. 流形穿孔邻域三次厄米特 $C^1$ 单纯形插值自愈 (`exp5_manifold_puncture_c1_simplex_healing`)
 - **硬性拔除中心微专家 (`punctured_center_eid`)**: `0`
 - **单纯形邻域伴随微专家 (`healed_top_neighbors`)**: `[1, 2, 3]`
 - **$C^1$ 单纯形邻域插值自愈余弦 (`c1_simplex_healing_cosine`)**: **`0.999977`**
-- **自愈场与真实目标场余弦 (`healed_to_true_field_cosine`)**: **`0.999681`**
+- **自愈场与真实目标场余弦 (`healed_to_true_field_cosine`)**: **`0.999679`**
 
 ### 6. 六大森林自治算子、非对称谱双聚类、多坐标卡图册与霍奇三分解「拓扑虫洞道岔」 (`exp6_six_autonomous_forest_ops_and_wormhole`)
 - **所有衍生块类型均为 `PMCPackage` (`all_packages_are_pmc`)**: **`true`**
@@ -57,8 +57,8 @@
 - **验证思考回流触发 `Auto-Mitosis` 虫洞道岔分裂数 (`wormhole_mitosis_switches`)**: **`1`**（在同一子键行开辟伴随列构建直达虫洞，100% 保留原多步思考盘山公路）
 
 ### 7. 15 步端到端免清洗拖拽流形训练 (`end_to_end_training_15steps`)
-- `Step 01`: `ChordLoss = 0.1413` | `ActivePMC = 35` | `Mitosis = 5` | `Closure = 0`
-- `Step 05`: `ChordLoss = 0.1438` | `ActivePMC = 4270` | `Mitosis = 27` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
-- `Step 10`: `ChordLoss = 0.3134` | `ActivePMC = 3910` | `Mitosis = 78` | `Closure = 192` | 触发 `Auto-Split (128 -> 64, 64)` + `Auto-Closure`
-- `Step 15`: `ChordLoss = 0.4511` | `ActivePMC = 3981` | `Mitosis = 135` | `Closure = 256` | 触发 `Auto-Merge (TriadicMerge_1_s15.pmc, coact=1.0)` + `Auto-Closure`
+- `Step 01`: `ChordLoss = 0.1615` | `ActivePMC = 35` | `Mitosis = 5` | `Closure = 0`
+- `Step 05`: `ChordLoss = 0.1871` | `ActivePMC = 4269` | `Mitosis = 27` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
+- `Step 10`: `ChordLoss = 0.3170` | `ActivePMC = 3916` | `Mitosis = 78` | `Closure = 192` | 触发 `Auto-Split (128 -> 64, 64)` + `Auto-Closure`
+- `Step 15`: `ChordLoss = 0.3510` | `ActivePMC = 3981` | `Mitosis = 126` | `Closure = 256` | 触发 `Auto-Merge (TriadicMerge_1_s15.pmc, coact=1.0)` + `Auto-Closure`
 

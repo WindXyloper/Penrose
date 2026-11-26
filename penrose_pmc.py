@@ -28,6 +28,12 @@ from bkp_manager import (
     SIMPLEX_3_BARYCENTER_PROJ,
     JET_NORMAL_ALPHA_STAR,
     JET_TANGENT_NORM_STAR,
+    HEAD_INV_GAIN,
+    HEAD_UNIFORM_RATIO,
+    SUBSPACE_STD_SCALE,
+    AMBIENT_NOISE_FLOOR,
+    GUMBEL_SINK_DIV_STAR,
+    FUNNEL_RESONANCE_APERTURE,
     closed_form_gumbel_threshold,
     round_up_to_standard_grid,
     BKPMountMode as PMCMountMode,
@@ -556,9 +562,9 @@ class PMCManager(BKPManager):
             return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0}
 
         v_tan = q_t - (q_t * q_c).sum(dim=-1, keepdim=True) * q_c
-        # 法向负散度分量 (-0.65 * q_c) 控制散度门控 (div V < 0)，
-        # 切向推进分量 (2.5 * v_tan) 在 Module 5 切空间正交化滤除法向分量后直接推动状态滑向 q_target！
-        v_desired = 2.5 * v_tan - 0.65 * q_c
+        # 公理 3 闭式正交合成：法向向心凝聚分量 (-1/sqrt(3) * q_c) 形成标准负散度势阱 (div V < 0)，
+        # 切向推进分量 (sqrt(3) * v_tan) 在 Module 5 切空间正交化滤除法向分量后直接推动状态滑向 q_target！
+        v_desired = (1.0 / SIMPLEX_3_BARYCENTER_PROJ) * v_tan - SIMPLEX_3_BARYCENTER_PROJ * q_c
 
         # 100% 复用 BKPManager._standardize_subqueries 与 normalized_codebooks，确保 Kaczmarz 写入与测地圆读取共享同一子键流形坐标系！
         q1_psi, q2_psi = self._standardize_subqueries(psi, update_center=False)
@@ -657,11 +663,13 @@ class PMCManager(BKPManager):
             cnt_d = hit_counts[direct_update_u]
             cos_d = cos_v_u[direct_update_u]
 
-            h_m = pkg.activation_counts[upd_eids].float() + cnt_d.float()
+            h_old = pkg.activation_counts[upd_eids].float()
+            h_m = h_old + cnt_d.float()
             r_m = pkg.purity_r[upd_eids].float()
+            js_cap = 1.0 - SUBSPACE_STD_SCALE
             gamma_js = torch.where(
-                h_m > 1.5,
-                ((h_m * r_m.pow(2) - 1.0) / (h_m - 1.0).clamp_min(1.0)).clamp(0.0, 0.95),
+                h_m > 1.0,
+                ((h_m * r_m.pow(2) - 1.0) / (h_m - 1.0).clamp_min(1.0)).clamp(0.0, js_cap),
                 torch.zeros_like(h_m),
             ).unsqueeze(-1)
 
@@ -684,10 +692,14 @@ class PMCManager(BKPManager):
 
             pkg.write_experts_to_mmap_pages(upd_eids, u_final, v_final)
             pkg.activation_counts[upd_eids] += cnt_d.to(pkg.activation_counts.dtype)
+            # 冯·米塞斯-费舍尔 (vMF) 球面相干纯度精确样本加权递推 (零经验 EMA 魔数)
+            vmf_purity = ((h_old * r_m + cnt_d.float() * cos_d.clamp_min(0.0)) / h_m.clamp_min(1.0)).clamp(
+                SIMPLEX_3_BARYCENTER_PROJ, 1.0
+            )
             new_pur = torch.where(
                 upd_empty,
                 torch.ones_like(r_m),
-                (0.85 * r_m + 0.15 * cos_d.clamp_min(0.0)).clamp(0.5, 1.0),
+                vmf_purity,
             )
             pkg.purity_r[upd_eids] = new_pur
 

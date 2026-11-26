@@ -46,6 +46,18 @@ def closed_form_gumbel_threshold(n_grid: float) -> float:
     return b_n + (EULER_MASCHERONI + GUMBEL_STD_COEFF) / b_n
 
 
+# 由七大第一性原理与物理维度 (D_BKP=2048, BKP_NUM_HEADS=8, BKP_HEAD_DIM=256) 唯一导出的派生闭式常数
+HEAD_INV_GAIN: float = 1.0 / math.sqrt(float(BKP_NUM_HEADS))           # 8 头正交等距子空间幅值缩放比 1/sqrt(8) ≈ 0.35355
+HEAD_UNIFORM_RATIO: float = 1.0 / float(BKP_NUM_HEADS)                 # 单头均匀子空间能量权重 1/8 = 0.125
+SUBSPACE_STD_SCALE: float = 1.0 / math.sqrt(float(BKP_HEAD_DIM))       # 单头球面各向同性标准差 1/sqrt(256) = 0.0625
+AMBIENT_NOISE_FLOOR: float = 1.0 / math.sqrt(float(D_BKP))             # 2048 维母体超球面随机正交内积标准差 1/sqrt(2048) ≈ 0.02210
+GUMBEL_SINK_DIV_STAR: float = (                                        # 8 头检索下负散度势阱显著超越背景噪声的冈贝尔闭式门限 ≈ -0.0475
+    -closed_form_gumbel_threshold(float(BKP_NUM_HEADS)) / math.sqrt(float(D_BKP))
+)
+FUNNEL_RESONANCE_APERTURE: float = 0.5 * (1.0 + SIMPLEX_2_GEODESIC_PROJ)  # 单字重叠 1/sqrt(2) 与完整词重合 1.0 的几何中点孔径 ≈ 0.85355
+
+
+
 class BKPMountMode(Enum):
     """对应 Penrose Harness VFS 三级目录的 OS 页表级读写保护权限"""
     RO_SYS = "ro_sys"          # /bkp/sys/ (Base.bkp 等): PROT_READ 全局硬件只读
@@ -479,7 +491,7 @@ class BKPPackage(nn.Module):
         return self.q_ema_mean
 
     @torch.no_grad()
-    def update_query_cone_center(self, batch_mean: torch.Tensor, momentum: float = 0.05) -> None:
+    def update_query_cone_center(self, batch_mean: torch.Tensor, momentum: float = SUBSPACE_STD_SCALE) -> None:
         """
         以指数移动平均 (EMA / BatchNorm running stats 思想) 吸收当前训练批次的逐 Token 标准化查询均值:
         mu_ema <- (1 - beta) * mu_ema + beta * mean_{t}(q_hat_t), beta = max(momentum, 1/(k+1))
@@ -529,7 +541,7 @@ class BKPPackage(nn.Module):
         self.q_dewhiten_mat.copy_(dew_mat.view(BKP_NUM_HEADS, 2, d, d))
 
     @torch.no_grad()
-    def update_query_manifold_metric(self, batch_cov: torch.Tensor, momentum: float = 0.05) -> None:
+    def update_query_manifold_metric(self, batch_cov: torch.Tensor, momentum: float = SUBSPACE_STD_SCALE) -> None:
         """以 EMA 吸收当前批次去均值查询的二阶流形协方差度规，并刷新球面化正逆变换矩阵 (零 .item() 同步)"""
         d = BKP_SUBKEY_DIM
         target = batch_cov.detach().float().reshape(BKP_NUM_HEADS, 2, d, d).to(self.q_ema_cov.device)
@@ -550,7 +562,7 @@ class BKPPackage(nn.Module):
         return self.q_post_ema_mean
 
     @torch.no_grad()
-    def update_query_post_cone_center(self, batch_mean: torch.Tensor, momentum: float = 0.05) -> None:
+    def update_query_post_cone_center(self, batch_mean: torch.Tensor, momentum: float = SUBSPACE_STD_SCALE) -> None:
         """
         以 EMA 吸收当前训练批次的"归一化后球面方向均值" E_t[q_final_t] (零 .item() 同步):
         - 该均值是 /std2 逐 Token 非线性除法的产物 (减完一级中心后 E_t[diff]=0，但 E_t[diff/|diff|] ≠ 0)；
@@ -1066,7 +1078,7 @@ class BKPPackage(nn.Module):
         }
 
     @torch.no_grad()
-    def expand_quadrant_2x(self, perturb_scale: float = 0.05) -> None:
+    def expand_quadrant_2x(self, perturb_scale: float = SUBSPACE_STD_SCALE) -> None:
         """
         3.4.2 节: 四象限无损倍增扩容 (K_p x K_p -> 2K_p x 2K_p, 对应 (a+b)^2 = a^2 + 2ab + b^2)
         左上象限 E_11 原位保留全部存量微专家；其余三个新增象限 (E_12, E_21, E_22) 的 v_val 严格置 0，
@@ -1291,9 +1303,9 @@ class BKPPackage(nn.Module):
             # 在剥离空白死区后的活跃子图 (r_act_n x c_act_n) 上扫描真实非对称切分点 (sr, sc)
             prefix = torch.zeros((r_act_n + 1, c_act_n + 1), dtype=torch.float32, device=c_mat.device)
             prefix[1:, 1:] = c_cand.cumsum(dim=0).cumsum(dim=1)
-            min_r_m = max(2, r_act_n // 16)
-            min_c_m = max(2, c_act_n // 16)
-            min_cluster_act = 0.03 * total_act
+            min_r_m = max(2, r_act_n // (2 * BKP_NUM_HEADS))
+            min_c_m = max(2, c_act_n // (2 * BKP_NUM_HEADS))
+            min_cluster_act = (1.0 / float(STANDARD_GRID_SIZES[0])) * total_act
 
             r_zero = int((f_r[sub_r_perm] < 0).sum().item())
             c_zero = int((f_c[sub_c_perm] < 0).sum().item())
@@ -1424,10 +1436,10 @@ class BKPPackage(nn.Module):
             src_v = merged.v_codebook.data[:, :ka + kb, :]
             idx = torch.arange(pad, device=dev) % (ka + kb)
             merged.u_codebook.data[:, ka + kb:, :] = F.normalize(
-                src_u[:, idx, :] + 0.05 * torch.randn(BKP_NUM_HEADS, pad, BKP_SUBKEY_DIM, device=dev), dim=-1
+                src_u[:, idx, :] + SUBSPACE_STD_SCALE * torch.randn(BKP_NUM_HEADS, pad, BKP_SUBKEY_DIM, device=dev), dim=-1
             )
             merged.v_codebook.data[:, ka + kb:, :] = F.normalize(
-                src_v[:, idx, :] + 0.05 * torch.randn(BKP_NUM_HEADS, pad, BKP_SUBKEY_DIM, device=dev), dim=-1
+                src_v[:, idx, :] + SUBSPACE_STD_SCALE * torch.randn(BKP_NUM_HEADS, pad, BKP_SUBKEY_DIM, device=dev), dim=-1
             )
 
         # 主对角线填入 E_A 与 E_B，非对角 2ab 象限与补齐区保持 v_val = 0 (scale_v = 0)

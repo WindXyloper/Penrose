@@ -53,9 +53,9 @@
     "module4_layers": 6,
     "module1_psi0_norm_err": 6e-08,
     "module1_prefetched_pages": 23,
-    "module5_tangent_orthogonality_err": 1.2e-07,
+    "module5_tangent_orthogonality_err": 2.3e-07,
     "module5_q_next_norm_err": 6e-08,
-    "branch_c_chord_loss": 0.998645,
+    "branch_c_chord_loss": 0.998834,
     "tri_state_branch_trace": [
       "branch_a_curl_loop",
       "branch_a_curl_loop",
@@ -64,8 +64,8 @@
   },
   "exp4_adamw_free_kaczmarz_and_dirty_shell": {
     "pmc_optimizer_memory_bytes": 0,
-    "doc1_loss_before_to_after": "1.0022 -> 0.5071",
-    "doc2_loss_before_to_after": "0.7920 -> 0.4011",
+    "doc1_loss_before_to_after": "1.0022 -> 0.5072",
+    "doc2_loss_before_to_after": "0.7922 -> 0.4035",
     "total_kaczmarz_snaps": 32,
     "total_mitosis_spawns": 9,
     "clean_query_json_leakage": false
@@ -107,12 +107,12 @@
     "vocab_size": 0,
     "pmc_optimizer_memory_bytes": 0,
     "steps": 15,
-    "elapsed_sec": 20.273,
+    "elapsed_sec": 23.59,
     "history": [
       {
         "step": 1,
         "num_wavepackets": 34,
-        "loss": 0.141333,
+        "loss": 0.161533,
         "active_pages": 35,
         "mitosis_spawns": 5,
         "closure_count": 0,
@@ -121,8 +121,8 @@
       {
         "step": 5,
         "num_wavepackets": 35,
-        "loss": 0.143839,
-        "active_pages": 4270,
+        "loss": 0.187116,
+        "active_pages": 4269,
         "mitosis_spawns": 27,
         "closure_count": 64,
         "forest_events": [
@@ -145,8 +145,8 @@
       {
         "step": 10,
         "num_wavepackets": 37,
-        "loss": 0.313423,
-        "active_pages": 3910,
+        "loss": 0.31697,
+        "active_pages": 3916,
         "mitosis_spawns": 78,
         "closure_count": 192,
         "forest_events": [
@@ -156,7 +156,7 @@
             "parent_pkg": "Spec_general_1_s5.pmc",
             "child_a": "Spec_general_1_s5_SubA_s10.pmc",
             "child_b": "Spec_general_1_s5_SubB_s10.pmc",
-            "bridge_pkg": null,
+            "bridge_pkg": "Spec_general_1_s5_BridgeAB_s10.pmc",
             "grid_k": "128 -> (64, 64)"
           },
           {
@@ -170,16 +170,16 @@
       {
         "step": 15,
         "num_wavepackets": 20,
-        "loss": 0.451104,
+        "loss": 0.351036,
         "active_pages": 3981,
-        "mitosis_spawns": 135,
+        "mitosis_spawns": 126,
         "closure_count": 256,
         "forest_events": [
           {
             "step": 15,
             "op": "Auto-Merge",
             "pkg_a": "Base_v1.pmc",
-            "pkg_b": "Spec_general_1_s5_SubB_s10.pmc",
+            "pkg_b": "Spec_general_1_s5_SubA_s10.pmc",
             "merged_pkg": "TriadicMerge_1_s15.pmc",
             "coactivation_ratio": 1.0,
             "new_grid_k": 128

@@ -17,6 +17,10 @@ import torch.nn.functional as F
 from penrose_pmc import (
     D_BKP,
     BKP_NUM_HEADS,
+    JET_NORMAL_ALPHA_STAR,
+    AMBIENT_NOISE_FLOOR,
+    GUMBEL_SINK_DIV_STAR,
+    FUNNEL_RESONANCE_APERTURE,
     closed_form_gumbel_threshold,
     PMCMountMode,
     PMCRoutingConfig,
@@ -175,9 +179,10 @@ class HolographicWavepacketTransducer(nn.Module):
         decoded_bytes = bytearray()
         slot_peaks: List[float] = []
 
-        # 公理 2 自适应孔径：当波包含 k 个字节时每个槽位理论峰值为 1/sqrt(k) >= 1/sqrt(max_slots) = 0.25，
-        # 而空槽位背景极值噪声上确界为 tau_z*(256)/sqrt(2048) ≈ 0.0752，取几何分界阈值 0.165
-        tau_aperture = max(0.165, self.gumbel_tau_256 * 1.8)
+        # 公理 2 闭式自适应孔径：满载波包最低有效槽位振幅为 1/sqrt(max_slots) = 0.25，
+        # 空槽位背景极值噪声上确界为 tau_z*(256)/sqrt(2048) ≈ 0.07525，取两者精确算术中点 (零经验魔数)
+        min_signal_amp = 1.0 / math.sqrt(float(self.max_slots))
+        tau_aperture = 0.5 * (min_signal_amp + self.gumbel_tau_256)
 
         for i in range(self.max_slots):
             ch = i % 8
@@ -236,8 +241,8 @@ class HolographicWavepacketTransducer(nn.Module):
         diag = pmc_manager.query_with_helmholtz_diagnostics(q_cand.view(1, 1, D_BKP))
         max_res = float(diag.max_resonance.item())
         div_val = float(diag.div_v.item())
-        # 漏斗捕获判据：共振强度跨过吸引盆核心孔径 (> 0.88，区分单字前缀 1/sqrt(2)=0.707 与完整词 1.0)，且散度显著为负
-        is_captured = (max_res > 0.88) and (div_val < -0.05)
+        # 闭式漏斗捕获判据：共振强度跨过几何中点孔径 0.5*(1 + 1/sqrt(2)) ≈ 0.8536，且散度低于冈贝尔负散度门限 -tau_z*(8)/sqrt(2048)
+        is_captured = (max_res > FUNNEL_RESONANCE_APERTURE) and (div_val < GUMBEL_SINK_DIV_STAR)
         effective_div = div_val if is_captured else 0.0
         return is_captured, effective_div, q_cand
 
@@ -386,7 +391,7 @@ class PenroseHarness(nn.Module):
         self,
         word_str: str,
         next_word_str: Optional[str] = None,
-        sink_strength: float = 0.85,
+        sink_strength: float = JET_NORMAL_ALPHA_STAR,
     ) -> int:
         """
         冷启动与流形生长闭环算子（Negative-Divergence Sink Nucleation）：
@@ -427,8 +432,8 @@ class PenroseHarness(nn.Module):
         self,
         q_curr: torch.Tensor,
         q_prev: Optional[torch.Tensor] = None,
-        max_internal_curl_ticks: int = 8,
-        sink_div_threshold: float = -0.02,
+        max_internal_curl_ticks: int = BKP_NUM_HEADS,
+        sink_div_threshold: float = -AMBIENT_NOISE_FLOOR,
     ) -> Dict[str, Any]:
         """
         Module 5 出口的硬件级三态总线分支执行器（用于推理与自治状态机演进）：

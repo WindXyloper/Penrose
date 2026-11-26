@@ -30,6 +30,9 @@ from penrose_pmc import (
     D_BKP,
     JET_NORMAL_ALPHA_STAR,
     JET_TANGENT_NORM_STAR,
+    HEAD_INV_GAIN,
+    HEAD_UNIFORM_RATIO,
+    SUBSPACE_STD_SCALE,
     PMCManager,
     HelmholtzFieldDiagnostics,
 )
@@ -166,7 +169,7 @@ class MPUModule3WaistCoupler(nn.Module):
         self.d_bkp = config.d_bkp
         self.bus_norm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
         self.w_delta = nn.Linear(config.d_model, config.d_model, bias=False)
-        nn.init.orthogonal_(self.w_delta.weight, gain=0.25)
+        nn.init.orthogonal_(self.w_delta.weight, gain=HEAD_INV_GAIN)
 
         if self.d_model != self.d_bkp:
             self.p_in = nn.Parameter(torch.empty(self.d_model, self.d_bkp))
@@ -201,7 +204,7 @@ class MPUModule3WaistCoupler(nn.Module):
             scale = math.sqrt(float(self.d_bkp) / float(self.d_model))
             q_2048 = F.normalize((torch.matmul(h_n, self.p_in) * scale).float(), dim=-1)
         if psi_0_anchor is not None:
-            q_2048 = F.normalize(psi_0_anchor.float() + 0.12 * q_2048, dim=-1)
+            q_2048 = F.normalize(psi_0_anchor.float() + HEAD_UNIFORM_RATIO * q_2048, dim=-1)
         return q_2048.to(h.dtype)
 
     def to_model_space(self, delta_2048: torch.Tensor) -> torch.Tensor:
@@ -349,7 +352,7 @@ class PenroseMPU(nn.Module):
             BicameraDecoderLayer(self.config, idx) for idx in range(6, 12)
         ])
         self.final_norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
-        self.step_gain = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
+        self.step_gain = nn.Parameter(torch.tensor(HEAD_INV_GAIN, dtype=torch.float32))
 
         self.module5_egress = MPUModule5GeodesicEgress()
 
@@ -444,7 +447,7 @@ class PenroseMPU(nn.Module):
         # 4. Module 4: 后 6 层轨迹曲率精炼栈与风格塑形器 (Upper 6 Blocks)
         # 零 .item() 同步阻塞：纯张量掩码判断 z_highway 是否为非零流形脉冲
         has_highway = z_highway.abs().amax(dim=-1, keepdim=True) > 1e-7
-        z_highway = torch.where(has_highway, z_highway, h_coupled.detach() * 0.1)
+        z_highway = torch.where(has_highway, z_highway, h_coupled.detach() * HEAD_UNIFORM_RATIO)
         h_upper = h_coupled
         for layer in self.module4_upper_stack:
             h_upper, _, _ = layer(
@@ -456,7 +459,7 @@ class PenroseMPU(nn.Module):
                 delta_h_bkp_highway=z_highway,
             )
         h_final = self.final_norm(h_upper)
-        delta_q_backbone = self._exit_backbone(h_final) * torch.clamp(self.step_gain, 0.05, 2.0)
+        delta_q_backbone = self._exit_backbone(h_final) * torch.clamp(self.step_gain, SUBSPACE_STD_SCALE, 2.0)
         delta_q_total = delta_q_backbone + diag.delta_pmc.to(delta_q_backbone.dtype)
 
         # 5. Module 5: 跨核球面 ResNet 闭环器 (Geodesic Residual Egress)
