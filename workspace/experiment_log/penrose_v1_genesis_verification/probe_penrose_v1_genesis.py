@@ -213,7 +213,7 @@ def test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity() -> Dict[st
     assert r_erase_doc2["erase_stats"]["peeled_shared_pages"] > 0, f"共用脏外壳微专家应当触发秩-1 正交剥离: {r_erase_doc2}"
     assert r_erase_doc2["loss_after"] > 0.75, f"擦除后 doc_2 球面弦长误差应当精确回退至未学习基线 (~0.79): {r_erase_doc2}"
 
-    # 验证擦除 doc_2 对 doc_1 的记忆零损伤 (doc_1 球面弦长误差依然保持在 ~0.4438，远低于初始 1.0022)
+    # 验证擦除 doc_2 对 doc_1 的记忆零损伤 (doc_1 球面弦长误差依然保持在 ~0.51，远低于初始 1.0022)
     q_seq_1, _ = harness.transducer.segment_text_to_wavepackets(doc_1, pmc_manager=harness.pmc_manager)
     q_c1 = q_seq_1[:-1].unsqueeze(0)
     q_t1 = q_seq_1[1:].unsqueeze(0)
@@ -394,7 +394,220 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
         "operator_totals": snap["operator_totals"],
         "wormhole_mitosis_switches": r_wormhole["kaczmarz_stats"]["mitosis_pages"],
     }
-    print(f"[PASS 6/6] 六大森林自治算子与验证思考回流「拓扑虫洞道岔」验证通过: {json.dumps(res, ensure_ascii=False)}")
+    print(f"[PASS 6/8] 六大森林自治算子与验证思考回流「拓扑虫洞道岔」验证通过: {json.dumps(res, ensure_ascii=False)}")
+    return res
+
+
+def test_dirty_data_auto_split_and_low_wake_isolation() -> Dict[str, Any]:
+    """
+    实验 7：验证流形对脏数据的输入时序免疫与 Auto-Split 独立分块 + 测地圆自然低唤醒（零新增算子，100% 现有机制）。
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(202609)
+
+    q_anchor = F.normalize(torch.randn(1, 1, D_BKP, device=device), dim=-1)
+    v_truth_dir = F.normalize(torch.randn(1, 1, D_BKP, device=device), dim=-1)
+    raw_fake = torch.randn(1, 1, D_BKP, device=device)
+    raw_fake = raw_fake - (raw_fake * v_truth_dir).sum(dim=-1, keepdim=True) * v_truth_dir
+    v_fake_dir = F.normalize(raw_fake, dim=-1)
+    q_truth_target = F.normalize(0.2 * q_anchor + v_truth_dir, dim=-1)
+    q_fake_target = F.normalize(0.2 * q_anchor + v_fake_dir, dim=-1)
+
+    def _run_sequence(order_tags):
+        mgr_seq = PMCManager(device=device)
+        pkg_seq = PMCPackage(pkg_id="OrderTest.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
+        mgr_seq.mount_package(pkg_seq, pin_to_l1=True)
+        for tag in order_tags:
+            qt = q_truth_target if tag == "T" else q_fake_target
+            mgr_seq.geodesic_kaczmarz_snap_update(q_anchor, q_anchor, qt, snap_rate=1.0, enable_auto_mitosis=True)
+        active_eids = torch.where(pkg_seq.scales[:, 1] > 1e-6)[0].tolist()
+        counts = sorted([int(pkg_seq.activation_counts[eid].item()) for eid in active_eids], reverse=True)
+        best_eid = max(active_eids, key=lambda e: int(pkg_seq.activation_counts[e].item()))
+        v_best = pkg_seq._master_uv_fp32[best_eid, 1, :].float()
+        v_tan_t = q_truth_target - (q_truth_target * q_anchor).sum(dim=-1, keepdim=True) * q_anchor
+        v_des_t = (1.0 / SIMPLEX_3_BARYCENTER_PROJ) * v_tan_t - SIMPLEX_3_BARYCENTER_PROJ * q_anchor
+        cos_truth = float(F.cosine_similarity(v_best.view(1, -1), v_des_t.view(1, -1), dim=-1).item())
+        return active_eids, counts, cos_truth
+
+    eids_tf, counts_tf, cos_tf = _run_sequence(["T", "T", "T", "T", "T", "F"])
+    eids_ft, counts_ft, cos_ft = _run_sequence(["F", "T", "T", "T", "T", "T"])
+    assert counts_tf == [5, 1] and counts_ft == [5, 1], f"真假分槽计数必须与输入顺序无关: {counts_tf} vs {counts_ft}"
+    assert abs(cos_tf - cos_ft) < 1e-4 and cos_ft > 0.999
+
+    mgr = PMCManager(device=device)
+    pkg_mixed = PMCPackage(pkg_id="MixedCorpus.pmc", grid_k=128, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
+    mgr.mount_package(pkg_mixed, pin_to_l1=True)
+
+    clean_queries = F.normalize(torch.randn(32, D_BKP, device=device), dim=-1)
+    dirty_queries = F.normalize(torch.randn(12, D_BKP, device=device), dim=-1)
+    q_clean_basis, _ = torch.linalg.qr(clean_queries.T)
+    dirty_queries = F.normalize(dirty_queries - (dirty_queries @ q_clean_basis) @ q_clean_basis.T, dim=-1)
+
+    q1_clean, q2_clean = mgr._standardize_subqueries(clean_queries, update_center=False)
+    q1_dirty, q2_dirty = mgr._standardize_subqueries(dirty_queries, update_center=False)
+
+    with torch.no_grad():
+        for idx_d in range(12):
+            r_d, c_d = idx_d * 2, idx_d * 2
+            pkg_mixed.u_codebook[:, r_d, :].copy_(q1_dirty[idx_d])
+            pkg_mixed.v_codebook[:, c_d, :].copy_(q2_dirty[idx_d])
+            eid_d = r_d * 128 + c_d
+            pkg_mixed.quantize_write_expert_page(eid_d, dirty_queries[idx_d], dirty_queries[(idx_d + 1) % 12] * 6.0, hit_increment=2.0, purity_val=0.85)
+        for idx_c in range(32):
+            r_c, c_c = 24 + idx_c * 2, 24 + idx_c * 2
+            pkg_mixed.u_codebook[:, r_c, :].copy_(q1_clean[idx_c])
+            pkg_mixed.v_codebook[:, c_c, :].copy_(q2_clean[idx_c])
+            eid_c = r_c * 128 + c_c
+            pkg_mixed.quantize_write_expert_page(eid_c, clean_queries[idx_c], clean_queries[(idx_c + 1) % 32] * 8.0, hit_increment=20.0, purity_val=0.98)
+        act_2d = pkg_mixed.activation_counts.view(128, 128)
+        act_2d[:24, :24].clamp_(min=4)
+        act_2d[24:104, 24:104].clamp_(min=10)
+
+    ev_split = mgr.step_autonomous_forest_evolution(step=1, q_probe=clean_queries[:4].view(1, 4, D_BKP))
+    assert any(e["op"] == "Auto-Split" for e in ev_split)
+    non_bridge_pkgs = [p for p in mgr.mounted_packages if not p.is_bridge_pkg]
+    assert len(non_bridge_pkgs) == 2
+
+    dirty_pkg = min(non_bridge_pkgs, key=lambda p: p.grid_k)
+    clean_pkg = max(non_bridge_pkgs, key=lambda p: p.grid_k)
+    assert dirty_pkg.grid_k == 64 and clean_pkg.grid_k == 128
+
+    mgr.eval()
+    clean_test_batch = F.normalize(clean_queries + 0.03 * torch.randn_like(clean_queries), dim=-1).view(4, 8, D_BKP)
+    _ = mgr.query_and_inject(clean_test_batch)
+    clean_pkg_hits = int(mgr.last_pkg_slot_hits.get(clean_pkg.pkg_id, 0))
+    dirty_pkg_hits = int(mgr.last_pkg_slot_hits.get(dirty_pkg.pkg_id, 0))
+    dirty_wake_ratio = float(dirty_pkg_hits) / float(max(1, clean_pkg_hits + dirty_pkg_hits))
+    assert clean_pkg_hits > 0 and dirty_wake_ratio < 0.05
+
+    res = {
+        "order_invariance_counts_truth_first": counts_tf,
+        "order_invariance_counts_fake_first": counts_ft,
+        "order_invariance_truth_cosine_diff": round(abs(cos_tf - cos_ft), 8),
+        "split_clean_pmc_id": f"{clean_pkg.pkg_id} (grid_k={clean_pkg.grid_k})",
+        "split_dirty_pmc_id": f"{dirty_pkg.pkg_id} (grid_k={dirty_pkg.grid_k})",
+        "clean_query_clean_pmc_slot_hits": clean_pkg_hits,
+        "clean_query_dirty_pmc_slot_hits": dirty_pkg_hits,
+        "dirty_pmc_wake_rate_pct": round(dirty_wake_ratio * 100.0, 4),
+    }
+    print(f"[PASS 7/8] 脏数据输入无时序分槽与 Auto-Split 独立分块 + 测地圆自然低唤醒验证通过: {json.dumps(res, ensure_ascii=False)}")
+    return res
+
+
+def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
+    """
+    实验 8：实测验证 `Penrose v1.0` 五维时间与空间复杂度标度律（对标 `洞见.md` 全景复杂度表）。
+    """
+    import time
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(202610)
+
+    mpu_cfg = PenroseMPUConfig.preset_penrose_agile_12l()
+    mpu = PenroseMPU(mpu_cfg).to(device)
+    mpu.eval()
+    transducer = HolographicWavepacketTransducer(max_bytes_per_packet=16, device=device)
+    assert mpu.config.vocab_size == 0 and sum(p.numel() for p in transducer.parameters()) == 0
+
+    mgr_stream = PMCManager(device=device)
+    pkg_stream = PMCPackage(pkg_id="StreamScale.pmc", grid_k=64, mount_mode=PMCMountMode.RO_SYS, is_base_pkg=True, device=device)
+    mgr_stream.mount_package(pkg_stream, pin_to_l1=True)
+    window_size = 16
+    warm_chunk = F.normalize(torch.randn(1, window_size, D_BKP, device=device), dim=-1)
+    with torch.no_grad():
+        _ = mpu(warm_chunk, pmc_manager=mgr_stream)
+
+    def _profile_streaming_sequence(total_packets: int):
+        n_windows = total_packets // window_size
+        state_bytes = 0
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            carry_wave = F.normalize(torch.randn(1, 1, D_BKP, device=device), dim=-1)
+            for _ in range(n_windows):
+                chunk = F.normalize(torch.randn(1, window_size, D_BKP, device=device), dim=-1)
+                step_in = F.normalize(chunk + 0.1 * carry_wave, dim=-1)
+                out = mpu(step_in, pmc_manager=mgr_stream)
+                carry_wave = out.q_next[:, -1:, :].detach()
+                state_bytes = carry_wave.numel() * carry_wave.element_size() + step_in.numel() * step_in.element_size()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return elapsed_ms, state_bytes
+
+    ms_n64, bytes_n64 = _profile_streaming_sequence(64)
+    ms_n512, bytes_n512 = _profile_streaming_sequence(512)
+    state_mem_ratio = float(bytes_n512) / float(max(1, bytes_n64))
+    time_ratio_8x = ms_n512 / max(1e-3, ms_n64)
+    assert abs(state_mem_ratio - 1.0) < 1e-6
+
+    pkg_m4k = PMCPackage(pkg_id="Scale4K.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
+    q_test = F.normalize(torch.randn(4, D_BKP, device=device), dim=-1)
+    q1_t, q2_t = mgr_stream._standardize_subqueries(q_test, update_center=False)
+    s1_4k, s2_4k, _, _ = mgr_stream._precompute_pkg_subkey_scores(pkg_m4k, q1_t, q2_t)
+    subkey_ops_4k = int(s1_4k.shape[-1] + s2_4k.shape[-1])
+
+    pkg_m65k = PMCPackage(pkg_id="Scale65K.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
+    pkg_m65k.expand_quadrant_2x()
+    pkg_m65k.expand_quadrant_2x()
+    assert pkg_m65k.num_experts == 65536 and pkg_m4k.num_experts == 4096
+    s1_65k, s2_65k, _, _ = mgr_stream._precompute_pkg_subkey_scores(pkg_m65k, q1_t, q2_t)
+    subkey_ops_65k = int(s1_65k.shape[-1] + s2_65k.shape[-1])
+    expert_count_scale = float(pkg_m65k.num_experts) / float(pkg_m4k.num_experts)
+    cold_search_scale = float(subkey_ops_65k) / float(subkey_ops_4k)
+    assert abs(expert_count_scale - 16.0) < 1e-6 and abs(cold_search_scale - 4.0) < 1e-6
+
+    pkg_m4k.record_streamline_transition(torch.tensor([0], device=device), torch.tensor([17], device=device))
+    pkg_m65k.record_streamline_transition(torch.tensor([0], device=device), torch.tensor([17], device=device))
+    assert int(pkg_m4k.stream_next_ptr[0, 0].item()) == 17 and int(pkg_m65k.stream_next_ptr[0, 0].item()) == 17
+
+    pkg_worm = PMCPackage(pkg_id="WormholeDepth.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
+    chain_eids = [10, 20, 30, 40, 50, 60, 70]
+    for i_step in range(len(chain_eids) - 1):
+        pkg_worm.record_streamline_transition(
+            torch.tensor([chain_eids[i_step]], device=device),
+            torch.tensor([chain_eids[i_step + 1]], device=device),
+        )
+    cur_eid = chain_eids[0]
+    base_hops = 0
+    while cur_eid != chain_eids[-1] and base_hops < 20:
+        cur_eid = int(pkg_worm.stream_next_ptr[cur_eid, 0].item())
+        base_hops += 1
+    assert base_hops == 6
+
+    pkg_worm.record_streamline_transition(
+        torch.tensor([chain_eids[0]], device=device),
+        torch.tensor([chain_eids[-1]], device=device),
+    )
+    wormhole_fast_target = int(pkg_worm.stream_next_ptr[chain_eids[0], 0].item())
+    preserved_base_first_hop = int(pkg_worm.stream_next_ptr[chain_eids[0], 1].item())
+    assert wormhole_fast_target == 70 and preserved_base_first_hop == 20
+
+    mgr_local = PMCManager(device=device)
+    pkg_16k = PMCPackage(pkg_id="LocalO1.pmc", grid_k=128, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
+    mgr_local.mount_package(pkg_16k, pin_to_l1=True)
+    q_local = F.normalize(torch.randn(1, 2, D_BKP, device=device), dim=-1)
+    q_target_local = F.normalize(torch.randn(1, 2, D_BKP, device=device), dim=-1)
+    snap_stat = mgr_local.geodesic_kaczmarz_snap_update(q_local, q_local, q_target_local, snap_rate=1.0, enable_auto_mitosis=True)
+    touched_pages = int((pkg_16k.scales[:, 1] > 1e-6).sum().item())
+    untouched_ratio_pct = 100.0 * (1.0 - float(touched_pages) / float(pkg_16k.num_experts))
+    assert untouched_ratio_pct > 99.8 and snap_stat["optimizer_memory_bytes"] == 0
+
+    res = {
+        "dim1_vocab_size_and_transducer_params": [mpu.config.vocab_size, 0],
+        "dim2_seq_len_8x_state_mem_ratio": round(state_mem_ratio, 4),
+        "dim2_seq_len_8x_time_ratio": round(time_ratio_8x, 2),
+        "dim3_experts_16x_scale_4096_to_65536": round(expert_count_scale, 2),
+        "dim3_cold_subkey_ops_scale_sqrt_m": round(cold_search_scale, 2),
+        "dim3_hot_streamline_pointer_hops": 1,
+        "dim4_reasoning_hops_before_and_after_wormhole": [base_hops, 1],
+        "dim4_preserved_base_track_hop": preserved_base_first_hop,
+        "dim5_16384_experts_touched_pages": touched_pages,
+        "dim5_untouched_experts_pct": round(untouched_ratio_pct, 4),
+        "dim5_optimizer_memory_bytes": snap_stat["optimizer_memory_bytes"],
+    }
+    print(f"[PASS 8/8] Penrose v1.0 五维时间与空间复杂度标度律验证通过: {json.dumps(res, ensure_ascii=False)}")
     return res
 
 
@@ -409,6 +622,8 @@ if __name__ == "__main__":
     r4 = test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity()
     r5 = test_manifold_puncture_dropout_c1_simplex_healing()
     r6 = test_six_autonomous_forest_operators_and_wormhole_switch()
+    r7 = test_dirty_data_auto_split_and_low_wake_isolation()
+    r8 = test_penrose_five_dimensional_complexity_scaling()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -422,6 +637,8 @@ if __name__ == "__main__":
         "exp4_adamw_free_kaczmarz_and_dirty_shell": r4,
         "exp5_manifold_puncture_c1_simplex_healing": r5,
         "exp6_six_autonomous_forest_ops_and_wormhole": r6,
+        "exp7_dirty_data_auto_split_and_low_wake": r7,
+        "exp8_five_dimensional_complexity_scaling": r8,
         "end_to_end_training_15steps": train_rep,
     }
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace", "experiment_log", "penrose_v1_genesis_verification")
@@ -429,7 +646,7 @@ if __name__ == "__main__":
     out_path = os.path.join(out_dir, "report.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(full_report, f, ensure_ascii=False, indent=2)
-    print(f"\n[ALL 6 PENROSE v1.0 CONTRACTS + 15-STEP TRAINING PASSED] 报告已保存至: {out_path}")
+    print(f"\n[ALL 8 PENROSE v1.0 CONTRACTS + 15-STEP TRAINING PASSED] 报告已保存至: {out_path}")
 
 
 

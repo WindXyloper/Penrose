@@ -195,5 +195,40 @@
         ]
       }
     ]
+  },
+  "exp7_dirty_data_auto_split_and_low_wake": {
+    "order_invariance_counts_truth_first": [
+      5,
+      1
+    ],
+    "order_invariance_counts_fake_first": [
+      5,
+      1
+    ],
+    "order_invariance_truth_cosine_diff": 0.0,
+    "split_clean_pmc_id": "MixedCorpus_SubA_s1.pmc (grid_k=128)",
+    "split_dirty_pmc_id": "MixedCorpus_SubB_s1.pmc (grid_k=64)",
+    "clean_query_clean_pmc_slot_hits": 38,
+    "clean_query_dirty_pmc_slot_hits": 0,
+    "dirty_pmc_wake_rate_pct": 0.0
+  },
+  "exp8_five_dimensional_complexity_scaling": {
+    "dim1_vocab_size_and_transducer_params": [
+      0,
+      0
+    ],
+    "dim2_seq_len_8x_state_mem_ratio": 1.0,
+    "dim2_seq_len_8x_time_ratio": 8.52,
+    "dim3_experts_16x_scale_4096_to_65536": 16.0,
+    "dim3_cold_subkey_ops_scale_sqrt_m": 4.0,
+    "dim3_hot_streamline_pointer_hops": 1,
+    "dim4_reasoning_hops_before_and_after_wormhole": [
+      6,
+      1
+    ],
+    "dim4_preserved_base_track_hop": 20,
+    "dim5_16384_experts_touched_pages": 2,
+    "dim5_untouched_experts_pct": 99.9878,
+    "dim5_optimizer_memory_bytes": 0
   }
 }

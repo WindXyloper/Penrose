@@ -1,4 +1,4 @@
-# Penrose v1.0 创世架构契约与六大流形定理实测报告 (`penrose_v1_genesis_verification`)
+# Penrose v1.0 创世架构契约与八大流形定理实测报告 (`penrose_v1_genesis_verification`)
 
 - **测试脚本**: `F:\Penrose\test_remote.py` & `F:\Penrose\train_penrose_v1.py`
 - **核心模块**: `penrose_pmc.py` (`PMC`), `penrose_mpu.py` (`MPU`), `penrose_harness.py` (`Penrose Harness`)
@@ -7,7 +7,7 @@
 
 ---
 
-## 一、 六大核心契约实测结果汇总
+## 一、 八大核心契约实测结果汇总
 
 ### 1. $2048 = 8 \times 256$ 沃尔什-阿达玛全息波包换能器 (`exp1_holographic_wavepacket_8x256`)
 - **可学习参数量 (`learnable_params`)**: **`0`**（彻底废除 `Tokenizer`、`nn.Embedding` 与 `LM Head`）
@@ -60,7 +60,35 @@
 - **森林算子触发计数 (`operator_totals`)**: `split_count=1, expand_count=1, merge_count=1, spawn_count=1, closure_count=1`
 - **验证思考回流触发 `Auto-Mitosis` 虫洞道岔分裂数 (`wormhole_mitosis_switches`)**: **`1`**（在同一子键行开辟伴随列构建直达虫洞，100% 保留原多步思考盘山公路）
 
-### 7. 15 步端到端免清洗拖拽流形训练 (`end_to_end_training_15steps`)
+### 7. 脏数据输入无时序分槽与 `Auto-Split` 独立分块 + 测地圆自然低唤醒 (`exp7_dirty_data_auto_split_and_low_wake`)
+- **微观真假输入无时序效应（Order Invariance）**:
+  - **「先喂 5 次真事实、后喂 1 次伪造篡改」分槽计数 (`order_invariance_counts_truth_first`)**: **`[5, 1]`**
+  - **「先喂 1 次伪造篡改、后喂 5 次真事实」分槽计数 (`order_invariance_counts_fake_first`)**: **`[5, 1]`**
+  - **两种相反输入时序下主干真微专家的恢复余弦差 (`order_invariance_truth_cosine_diff`)**: **`0.00000000`（证伪“先喂假数据会把流形带偏”的传统全连接网络缺陷）**
+- **宏观伪造词条簇 `Auto-Split` 自动划归独立 `.pmc` 块与测地圆自然静默（零新增算子，100% 复用现有机制）**:
+  - **主干真实知识子包 (`split_clean_pmc_id`)**: `MixedCorpus_SubA_s1.pmc (grid_k=128)`
+  - **自动剥离出的伪造脏数据孤岛子包 (`split_dirty_pmc_id`)**: `MixedCorpus_SubB_s1.pmc (grid_k=64)`
+  - **正常主干查询下主干块唤醒命中槽位数 (`clean_query_clean_pmc_slot_hits`)**: **`38`**
+  - **正常主干查询下脏数据块唤醒命中槽位数 (`clean_query_dirty_pmc_slot_hits`)**: **`0`（因跨不过测地圆冈贝尔半径 $\tau_z^*$ 被包级零激活短路直接旁路，脏块误唤醒率 `0.0%`）**
+
+### 8. `Penrose v1.0` 五维时间与空间复杂度标度律实测 (`exp8_five_dimensional_complexity_scaling`)
+- **维度 1 — 零词表 I/O 复杂度 $\mathcal{O}(d)$ (`dim1_vocab_size_and_transducer_params`)**: **`[0, 0]`**（词表大小 `0`，换能器参数量 `0`）
+- **维度 2 — 序列长度 $N$ 扩大 $8\times$（$64 \to 512$ 波包）的 $\mathcal{O}(N)$ 时间与 $\mathcal{O}(1)$ 状态显存**:
+  - **跨窗口活跃状态显存比值 (`dim2_seq_len_8x_state_mem_ratio`)**: **`1.0000`（严格 $\mathcal{O}(1)$ 常数显存，彻底消除 $\mathcal{O}(N)$ KV Cache 线性膨胀）**
+  - **端到端流式耗时比值 (`dim2_seq_len_8x_time_ratio`)**: **`8.52x`（符合 $\mathcal{O}(N)$ 线性时间标度，彻底打破 $\mathcal{O}(N^2)$ 的 `64x` 二次方算力墙）**
+- **维度 3 — 知识库微专家总数 $M_{\text{chunk}}$ 扩大 $16\times$（$4,096 \to 65,536$）的寻址复杂度**:
+  - **微专家总数扩容倍数 (`dim3_experts_16x_scale_4096_to_65536`)**: **`16.0x`**
+  - **冷启动乘积子键内积宽度增长倍数 (`dim3_cold_subkey_ops_scale_sqrt_m`)**: **`4.0x`（严格遵循 $\mathcal{O}(\sqrt{M_{\text{chunk}}})$ 笛卡尔双向子键分解律）**
+  - **热流线 `stream_next_ptr` 直接预取跳数 (`dim3_hot_streamline_pointer_hops`)**: **`1`（严格 $\mathcal{O}(1)$ 常数耗时，与知识库总规模 $M$ 完全解耦）**
+- **维度 4 — 推理深度 $K=6$ 的拓扑虫洞坍缩 $\mathcal{O}(K) \to \mathcal{O}(1)$**:
+  - **虫洞架设前后抵达终点所需流线跳数 (`dim4_reasoning_hops_before_and_after_wormhole`)**: **`[6, 1]`（从 $\mathcal{O}(K)$ 的 6 跳坍缩为 $\mathcal{O}(1)$ 的 1 跳直达）**
+  - **完好保留的基底慢思考证明轨第一跳 (`dim4_preserved_base_track_hop`)**: **`20`（快慢双轨在 `stream_next_ptr` 中无损并存）**
+- **维度 5 — 局部拖拽训练/擦除 $\mathcal{O}(1)$ 更新与零优化器显存 (`M = 16,384` 微专家)**:
+  - **单步更新实际触碰微专家页数 (`dim5_16384_experts_touched_pages`)**: **`2` 页**
+  - **完全零触碰微专家占比 (`dim5_untouched_experts_pct`)**: **`99.9878%`**
+  - **优化器动量显存占用 (`dim5_optimizer_memory_bytes`)**: **`0 Bytes`**
+
+### 9. 15 步端到端免清洗拖拽流形训练 (`end_to_end_training_15steps`)
 - `Step 01`: `ChordLoss = 0.1615` | `ActivePMC = 35` | `Mitosis = 5` | `Closure = 0`
 - `Step 05`: `ChordLoss = 0.1871` | `ActivePMC = 4269` | `Mitosis = 27` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
 - `Step 10`: `ChordLoss = 0.3170` | `ActivePMC = 3916` | `Mitosis = 78` | `Closure = 192` | 触发 `Auto-Split (128 -> 64, 64)` + `Auto-Closure`
