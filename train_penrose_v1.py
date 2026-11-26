@@ -14,7 +14,7 @@ import os
 import json
 import time
 import argparse
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import torch
 
 from penrose_pmc import PMCMountMode, PMCPackage, PMCManager
@@ -34,9 +34,15 @@ def run_penrose_v1_training(
     steps: int = 20,
     lr_mpu: float = 1e-3,
     device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
-    use_full_2048: bool = True,
+    use_full_2048: Optional[bool] = None,
 ) -> Dict[str, Any]:
     device = torch.device(device_str)
+    if use_full_2048 is None:
+        if device.type == "cuda":
+            vram_gb = torch.cuda.get_device_properties(device).total_memory / float(1024**3)
+            use_full_2048 = bool(vram_gb >= 16.0)
+        else:
+            use_full_2048 = False
     cfg = (
         PenroseMPUConfig.preset_penrose_full_2048()
         if use_full_2048

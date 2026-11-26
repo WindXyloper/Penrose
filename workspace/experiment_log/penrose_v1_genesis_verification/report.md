@@ -46,18 +46,19 @@
 - **$C^1$ 单纯形邻域插值自愈余弦 (`c1_simplex_healing_cosine`)**: **`0.999977`**
 - **自愈场与真实目标场余弦 (`healed_to_true_field_cosine`)**: **`0.999681`**
 
-### 6. 六大森林自治算子、多坐标卡图册与霍奇三分解「拓扑虫洞道岔」 (`exp6_six_autonomous_forest_ops_and_wormhole`)
+### 6. 六大森林自治算子、非对称谱双聚类、多坐标卡图册与霍奇三分解「拓扑虫洞道岔」 (`exp6_six_autonomous_forest_ops_and_wormhole`)
 - **所有衍生块类型均为 `PMCPackage` (`all_packages_are_pmc`)**: **`true`**
 - **四叉树扩容零步误差 (`expand_zero_step_err`)**: **`0.00000000`**
 - **流线边自动重映射索引 (`stream_ptr_remapped_eid`)**: **`129`** (`(0,0) -> (1,1)` 在 `grid_k=128` 下精确映射为 $1 \times 128 + 1 = 129$)
-- **多坐标卡图册 (`SubA.pmc` + `SubB.pmc` + `BridgeAB.pmc`) 霍奇调和流占比 (`eta_harmonic_max`)**: **`> 0.0`（实测验证 $\mathcal{H}^1(\mathcal{M})$ 非平凡调和虫洞分量激活）**
-- **母体超球面共振归属路由 (`select_resonant_writable_package`)**: 自动路由至共振度最高的可写局部坐标卡 `ForestSeed_SubA_s2.pmc`
+- **非对称谱双聚类切分规格 (`asymmetric_split_grid_ks`)**: **`[64, 128]`**（在剥离未激活空白死区后的活跃子图上执行最小归一化电导割扫描，将 $20 \times 20$ 与 $88 \times 88$ 双簇精确向上补齐为 $64 \times 64$ 与 $128 \times 128$，摒弃硬编码 `k // 2` 中点对半切分）
+- **多坐标卡图册 (`SubA.pmc` + `SubB.pmc` + `BridgeAB.pmc`) 霍奇调和流占比 (`eta_harmonic_max`)**: **`1.0`（实测验证 $\mathcal{H}^1(\mathcal{M})$ 非平凡调和虫洞分量激活，且 100% 复用 `BKPManager.query_and_inject` 三级测地线球路由实现零重复扫描）**
+- **母体超球面共振归属路由 (`select_resonant_writable_package`)**: 自动路由至共振度最高的可写局部坐标卡 `ForestSeed_SubB_s2.pmc`
 - **森林算子触发计数 (`operator_totals`)**: `split_count=1, expand_count=1, merge_count=1, spawn_count=1, closure_count=1`
 - **验证思考回流触发 `Auto-Mitosis` 虫洞道岔分裂数 (`wormhole_mitosis_switches`)**: **`1`**（在同一子键行开辟伴随列构建直达虫洞，100% 保留原多步思考盘山公路）
 
 ### 7. 15 步端到端免清洗拖拽流形训练 (`end_to_end_training_15steps`)
-- `Step 01`: `ChordLoss = 0.9163 -> 0.2668` | `ActivePMC = 35` | `Mitosis = 9` | `Closure = 0`
-- `Step 05`: `ChordLoss = 0.4528 -> 0.8034` | `ActivePMC = 4272` | `Mitosis = 52` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
-- `Step 10`: `ChordLoss = 0.4725 -> 0.4063` | `ActivePMC = 4045` | `Mitosis = 149` | `Closure = 384` | 触发 `Auto-Split (128 -> 64, 64 + BridgeAB)` + `Auto-Closure`
-- `Step 15`: `ChordLoss = 0.4039 -> 0.3012` | `ActivePMC = 4196` | `Mitosis = 208` | `Closure = 512` | 触发 `Auto-Merge (TriadicMerge_1_s15.pmc, coact=0.9406)` + `Auto-Closure`
+- `Step 01`: `ChordLoss = 0.1413` | `ActivePMC = 35` | `Mitosis = 5` | `Closure = 0`
+- `Step 05`: `ChordLoss = 0.1438` | `ActivePMC = 4270` | `Mitosis = 27` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
+- `Step 10`: `ChordLoss = 0.3134` | `ActivePMC = 3910` | `Mitosis = 78` | `Closure = 192` | 触发 `Auto-Split (128 -> 64, 64)` + `Auto-Closure`
+- `Step 15`: `ChordLoss = 0.4511` | `ActivePMC = 3981` | `Mitosis = 135` | `Closure = 256` | 触发 `Auto-Merge (TriadicMerge_1_s15.pmc, coact=1.0)` + `Auto-Closure`
 

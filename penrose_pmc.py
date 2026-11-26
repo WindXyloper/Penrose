@@ -314,12 +314,27 @@ class PMCPackage(BKPPackage):
         purity_val: float = 1.0,
     ) -> None:
         dev = self.scales.device
-        eid_t = torch.tensor([int(eid)], dtype=torch.long, device=dev)
-        u_f = F.normalize(u_vec.detach().to(device=dev, dtype=torch.float32).view(1, D_BKP), dim=-1) * math.sqrt(float(D_BKP))
+        eid_int = int(eid)
+        eid_t = torch.tensor([eid_int], dtype=torch.long, device=dev)
+        u_unit = F.normalize(u_vec.detach().to(device=dev, dtype=torch.float32).view(1, D_BKP), dim=-1)
+        u_f = u_unit * math.sqrt(float(D_BKP))
         v_f = v_vec.detach().to(device=dev, dtype=torch.float32).view(1, D_BKP)
         self.write_experts_to_mmap_pages(eid_t, u_f, v_f)
-        self.activation_counts[eid] = self.activation_counts[eid] + int(max(1.0, round(hit_increment)))
-        self.purity_r[eid] = float(max(0.0, min(1.0, purity_val)))
+        self.activation_counts[eid_int] = self.activation_counts[eid_int] + int(max(1.0, round(hit_increment)))
+        self.purity_r[eid_int] = float(max(0.0, min(1.0, purity_val)))
+
+        # 同步将第一级笛卡尔路由码本 (u_codebook[r], v_codebook[c]) 对齐到 u_unit 的子空间方向，确保测地圆路由与页内键一致
+        r_idx = eid_int // self.grid_k
+        c_idx = eid_int % self.grid_k
+        u_heads = F.normalize(u_unit.view(BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+        self.u_codebook.data[:, r_idx, :] = PMCPackage.rodrigues_geodesic_rotation(
+            self.u_codebook.data[:, r_idx, :], u_heads[:, 0, :], step_fraction=1.0
+        )
+        self.v_codebook.data[:, c_idx, :] = PMCPackage.rodrigues_geodesic_rotation(
+            self.v_codebook.data[:, c_idx, :], u_heads[:, 1, :], step_fraction=1.0
+        )
+        self._u_cb_norm_cache = None
+        self._v_cb_norm_cache = None
 
     @torch.no_grad()
     def dequantize_expert_uv(self, eids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -366,49 +381,22 @@ class PMCManager(BKPManager):
         self.closure_count: int = 0
         self.forest_events: List[Dict[str, Any]] = []
 
-    @torch.no_grad()
-    def _record_manifold_telemetry(
-        self,
-        q_flat: torch.Tensor,
-        pkg_hit_masks: Dict[str, torch.Tensor],
-        global_max_res: torch.Tensor,
-    ) -> None:
-        N = q_flat.size(0)
-        self._total_periodic_queries = getattr(self, "_total_periodic_queries", 0) + N
-
-        active_pids = [pid for pid, m in pkg_hit_masks.items() if bool(m.any())]
-        for pid in active_pids:
-            cnt = float(pkg_hit_masks[pid].float().sum().item())
-            self.pkg_token_hit_counts[pid] = self.pkg_token_hit_counts.get(pid, 0.0) + cnt
-        if len(active_pids) >= 2:
-            for idx_a in range(len(active_pids)):
-                for idx_b in range(idx_a + 1, len(active_pids)):
-                    pa, pb = active_pids[idx_a], active_pids[idx_b]
-                    key = (pa, pb) if pa < pb else (pb, pa)
-                    co_hits = float((pkg_hit_masks[pa] & pkg_hit_masks[pb]).float().sum().item())
-                    if co_hits > 0:
-                        self.pkg_coactivation_counts[key] = self.pkg_coactivation_counts.get(key, 0.0) + co_hits
-
-        tau_desert = SIMPLEX_3_BARYCENTER_PROJ * 0.65
-        low_mask = global_max_res < tau_desert
-        n_low = int(low_mask.sum().item())
-        if n_low > 0:
-            self._low_hit_periodic_queries = getattr(self, "_low_hit_periodic_queries", 0) + n_low
-            q_low = F.normalize(q_flat[low_mask].detach().float(), dim=-1).view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM)
-            q1_low = q_low[:, :, 0, :]
-            q2_low = q_low[:, :, 1, :]
-            if self._low_hit_q1_reservoir is None or self._low_hit_q2_reservoir is None:
-                self._low_hit_q1_reservoir = q1_low[:256]
-                self._low_hit_q2_reservoir = q2_low[:256]
-            else:
-                self._low_hit_q1_reservoir = torch.cat([self._low_hit_q1_reservoir.to(q1_low.device), q1_low], dim=0)[-256:]
-                self._low_hit_q2_reservoir = torch.cat([self._low_hit_q2_reservoir.to(q2_low.device), q2_low], dim=0)[-256:]
-
     @property
     def mounted_packages(self) -> List[BKPPackage]:
         return list(self.packages.values())
 
     def get_writable_package(self) -> Optional[PMCPackage]:
+        for pid in reversed(self.l1_active_pkg_ids):
+            mk = self._mod_key(pid)
+            if mk not in self.packages:
+                continue
+            pkg = self.packages[mk]
+            if (
+                isinstance(pkg, PMCPackage)
+                and (not pkg.is_bridge_pkg)
+                and pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE)
+            ):
+                return pkg
         for pkg in reversed(self.mounted_packages):
             if not pkg.is_bridge_pkg and pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE):
                 if isinstance(pkg, PMCPackage):
@@ -422,30 +410,33 @@ class PMCManager(BKPManager):
     def select_resonant_writable_package(self, psi: torch.Tensor) -> Optional[PMCPackage]:
         """
         母体超球面 S^2047 局部坐标卡归属路由（Atlas Chart Resonance Routing）：
-        当流形图册中存在多张可写局部坐标卡（如 Auto-Split 产生的 SubA.pmc / SubB.pmc 或 Auto-Spawn 产生的新板块）时，
-        根据当前轨迹相空间态 psi 与各局部坐标卡码本的球面共振度，自动选择最匹配的 `.pmc` 坐标卡写入。
+        严格仅在 L1 快表 (self.l1_active_pkg_ids) 的可写局部坐标卡内，复用 BKPManager._standardize_subqueries
+        与 _precompute_pkg_subkey_scores 的 O(K_p) 状元分选择最匹配的 `.pmc` 坐标卡写入，绝不全局扫描冷包！
         """
-        writable_charts: List[PMCPackage] = [
-            pkg for pkg in self.mounted_packages
-            if isinstance(pkg, PMCPackage)
-            and (not pkg.is_bridge_pkg)
-            and pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE)
-        ]
-        if len(writable_charts) == 0:
+        l1_writable: List[PMCPackage] = []
+        for pid in self.l1_active_pkg_ids:
+            mk = self._mod_key(pid)
+            if mk not in self.packages:
+                continue
+            pkg = self.packages[mk]
+            if (
+                isinstance(pkg, PMCPackage)
+                and (not pkg.is_bridge_pkg)
+                and pkg.mount_mode in (PMCMountMode.RW_SHARED, PMCMountMode.COW_PRIVATE)
+            ):
+                l1_writable.append(pkg)
+        if len(l1_writable) == 0:
             return self.get_writable_package()
-        if len(writable_charts) == 1:
-            return writable_charts[0]
+        if len(l1_writable) == 1:
+            return l1_writable[0]
 
         psi_probe = psi.detach().float().reshape(-1, D_BKP)[:16]
-        psi_heads = F.normalize(psi_probe.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
-        best_pkg = writable_charts[-1]
+        q1, q2 = self._standardize_subqueries(psi_probe, update_center=False)
+        best_pkg = l1_writable[-1]
         best_score = -1e9
-        for chart in writable_charts:
-            u_cb = F.normalize(chart.u_codebook.detach().float(), dim=-1)
-            v_cb = F.normalize(chart.v_codebook.detach().float(), dim=-1)
-            su_max = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 0, :], u_cb).amax(dim=-1).mean()
-            sv_max = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 1, :], v_cb).amax(dim=-1).mean()
-            score = float((0.5 * (su_max + sv_max)).item())
+        for chart in l1_writable:
+            s1_c, s2_c, _, _ = self._precompute_pkg_subkey_scores(chart, q1, q2)
+            score = float((0.5 * (s1_c.amax(dim=-1).mean() + s2_c.amax(dim=-1).mean())).item())
             if score >= best_score:
                 best_score = score
                 best_pkg = chart
@@ -457,21 +448,25 @@ class PMCManager(BKPManager):
         psi_0: torch.Tensor,
         top_m: int = 8,
     ) -> List[Tuple[str, torch.Tensor]]:
+        """
+        Module 1 一阶射流早期预取：仅对 L1 快表 (self.l1_active_pkg_ids) 内的活跃包执行 O(K_p) 子键与 BTB 流线指针预取。
+        """
         self.prefetch_queue_eids.clear()
-        if len(self.mounted_packages) == 0:
+        if len(self.l1_active_pkg_ids) == 0:
             return self.prefetch_queue_eids
 
         q_flat = psi_0.detach().float().reshape(-1, D_BKP)
         q_probe = q_flat[: min(16, q_flat.size(0))]
-        q_heads = F.normalize(q_probe.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+        q1, q2 = self._standardize_subqueries(q_probe, update_center=False)
 
-        for pkg in self.mounted_packages:
-            u_cb = F.normalize(pkg.u_codebook.detach().float(), dim=-1)
-            v_cb = F.normalize(pkg.v_codebook.detach().float(), dim=-1)
-            su = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 0, :], u_cb)
-            sv = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 1, :], v_cb)
-            top_u = su.amax(dim=1).topk(min(top_m, pkg.grid_k), dim=-1).indices
-            top_v = sv.amax(dim=1).topk(min(top_m, pkg.grid_k), dim=-1).indices
+        for pid in self.l1_active_pkg_ids:
+            mk = self._mod_key(pid)
+            if mk not in self.packages:
+                continue
+            pkg = self.packages[mk]
+            s1_p, s2_p, _, _ = self._precompute_pkg_subkey_scores(pkg, q1, q2)
+            top_u = s1_p.amax(dim=1).topk(min(top_m, pkg.grid_k), dim=-1).indices
+            top_v = s2_p.amax(dim=1).topk(min(top_m, pkg.grid_k), dim=-1).indices
             eids_curr = (top_u * pkg.grid_k + top_v).reshape(-1).unique()
 
             if isinstance(pkg, PMCPackage):
@@ -483,190 +478,48 @@ class PMCManager(BKPManager):
             self.prefetch_queue_eids.append((pkg.pkg_id, eids_curr))
         return self.prefetch_queue_eids
 
-    @torch.no_grad()
-    def _select_candidate_grid_subset(
-        self,
-        pkg: BKPPackage,
-        q_heads: torch.Tensor,
-        sub_top_m: int = 8,
-        puncture_expert_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        白皮书两级笛卡尔乘积码本 O(K_p) 候选子集筛选器：
-        利用 u_codebook 与 v_codebook 先筛出当前批次在网格 K_p x K_p 上的高共振候选行与候选列，
-        仅返回筛出的非空微专家页号子集 cand_eids: (M_cand,)，彻底杜绝全表扫描！
-        """
-        k_p = pkg.grid_k
-        dev = q_heads.device
-        sv_1d = pkg.scales[:, 1]
-        active_1d = sv_1d > 0
-        if puncture_expert_mask is not None and puncture_expert_mask.numel() == pkg.num_experts:
-            active_1d = active_1d & (~puncture_expert_mask.to(active_1d.device))
-        if not bool(active_1d.any()):
-            return torch.empty(0, dtype=torch.long, device=dev)
-
-        active_2d = active_1d.view(k_p, k_p)
-        valid_r = active_2d.any(dim=1)  # (K_p,)
-        valid_c = active_2d.any(dim=0)  # (K_p,)
-
-        u_cb = F.normalize(pkg.u_codebook.detach().float(), dim=-1)  # (8, K_p, 128)
-        v_cb = F.normalize(pkg.v_codebook.detach().float(), dim=-1)  # (8, K_p, 128)
-        su = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 0, :], u_cb).mean(dim=1)  # (N, K_p)
-        sv = torch.einsum("nhd,hkd->nhk", q_heads[:, :, 1, :], v_cb).mean(dim=1)  # (N, K_p)
-
-        su = su.masked_fill(~valid_r.unsqueeze(0), -1e9)
-        sv = sv.masked_fill(~valid_c.unsqueeze(0), -1e9)
-
-        m_r = min(sub_top_m, int(valid_r.sum()))
-        m_c = min(sub_top_m, int(valid_c.sum()))
-        top_r = su.topk(max(1, m_r), dim=-1).indices  # (N, m_r)
-        top_c = sv.topk(max(1, m_c), dim=-1).indices  # (N, m_c)
-
-        cand_grid = (top_r.unsqueeze(-1) * k_p + top_c.unsqueeze(-2)).reshape(-1)
-        cand_rows_unique = top_r.reshape(-1).unique()
-        row_eids = torch.nonzero(active_2d[cand_rows_unique], as_tuple=False)
-        if row_eids.numel() > 0:
-            companion_eids = cand_rows_unique[row_eids[:, 0]] * k_p + row_eids[:, 1]
-            cand_all = torch.cat([cand_grid, companion_eids], dim=0).unique()
-        else:
-            cand_all = cand_grid.unique()
-
-        return cand_all[active_1d[cand_all]]
-
     def query_with_helmholtz_diagnostics(
         self,
         q_in: torch.Tensor,
         puncture_dropout_prob: float = 0.0,
         puncture_expert_mask: Optional[torch.Tensor] = None,
     ) -> HelmholtzFieldDiagnostics:
-        orig_shape = q_in.shape
-        B = orig_shape[0]
-        T = orig_shape[1] if len(orig_shape) == 3 else 1
-        q_flat = q_in.reshape(-1, D_BKP)
-        dev = q_flat.device
+        """
+        100% 复用 BKPManager.query_and_inject 的三层测地圆漏斗路由与 L2 能量守恒单位分解：
+        - 仅扫描 L1 快表 (l1_active_pkg_ids)，包级冈贝尔极值底线 tau_z^*(N_grid) 秒筛短路；
+        - 测地圆半径 [1/sqrt(3)*tau_z^*, 1/sqrt(2)*tau_z^*] 三次厄米特单纯形切子空间投影激活；
+        - 零点锚定 Softmax_1 + 严格 L2 能量守恒增益 ortho_gain 插值；
+        - 零全局扫描、零重复调页，直接读取 query_and_inject 原生产出的 _last_helmholtz_cache。
+        """
+        delta_pmc = self.query_and_inject(
+            q_in,
+            puncture_dropout_prob=puncture_dropout_prob,
+            puncture_expert_mask=puncture_expert_mask,
+        )
 
-        if len(self.mounted_packages) == 0:
-            zero_delta = torch.zeros_like(q_in)
+        hc = getattr(self, "_last_helmholtz_cache", None)
+        if hc is None:
+            B = q_in.shape[0]
+            T = q_in.shape[1] if q_in.dim() == 3 else 1
+            dev = q_in.device
             zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
-            empty_idx = torch.zeros((B, T, 1), device=dev, dtype=torch.long)
             return HelmholtzFieldDiagnostics(
-                delta_pmc=zero_delta,
+                delta_pmc=delta_pmc,
                 div_v=zero_scalar,
                 eta_curl=torch.ones_like(zero_scalar),
-                active_experts=empty_idx,
+                active_experts=torch.zeros((B, T, 1), device=dev, dtype=torch.long),
                 active_weights=zero_scalar.unsqueeze(-1),
                 max_resonance=zero_scalar,
                 eta_harmonic=zero_scalar,
             )
-
-        delta_pmc = self.query_and_inject(q_in)
-
-        with torch.no_grad():
-            q_unit = F.normalize(q_flat.float(), dim=-1)
-            q_heads = F.normalize(q_unit.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
-
-            pkg_hit_masks: Dict[str, torch.Tensor] = {}
-            global_max_res = torch.zeros(q_unit.size(0), device=dev, dtype=torch.float32)
-            u_atlas_list: List[torch.Tensor] = []
-            v_atlas_list: List[torch.Tensor] = []
-            eids_atlas_list: List[torch.Tensor] = []
-            bridge_flag_list: List[torch.Tensor] = []
-
-            for p_idx, p_iter in enumerate(self.mounted_packages):
-                p_mask = puncture_expert_mask if (puncture_expert_mask is not None and p_iter is self.mounted_packages[-1]) else None
-                cand_p = self._select_candidate_grid_subset(
-                    p_iter, q_heads, sub_top_m=8, puncture_expert_mask=p_mask
-                )
-                if cand_p.numel() == 0:
-                    continue
-                if isinstance(p_iter, PMCPackage):
-                    u_p, v_p = p_iter.dequantize_expert_uv(cand_p)
-                else:
-                    u_p = p_iter.expert_pages_int8[cand_p.cpu(), 0].float().to(dev) * p_iter.scales[cand_p, 0:1].float()
-                    v_p = p_iter.expert_pages_int8[cand_p.cpu(), 1].float().to(dev) * p_iter.scales[cand_p, 1:2].float()
-                u_p_unit = F.normalize(u_p.to(dev), dim=-1)
-                v_p_dev = v_p.to(dev)
-                sim_p = torch.matmul(q_unit, u_p_unit.t())
-                max_p = sim_p.amax(dim=-1)
-                global_max_res = torch.maximum(global_max_res, max_p)
-                pkg_hit_masks[p_iter.pkg_id] = max_p >= SIMPLEX_3_BARYCENTER_PROJ * 0.50
-
-                u_atlas_list.append(u_p_unit)
-                v_atlas_list.append(v_p_dev)
-                eid_offset = 0 if len(self.mounted_packages) == 1 else (p_idx << 20)
-                eids_atlas_list.append(cand_p + eid_offset)
-                bridge_flag_list.append(
-                    torch.full((cand_p.numel(),), bool(p_iter.is_bridge_pkg), dtype=torch.bool, device=dev)
-                )
-
-            self._record_manifold_telemetry(q_unit, pkg_hit_masks, global_max_res)
-
-            if len(u_atlas_list) == 0:
-                zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
-                empty_idx = torch.zeros((B, T, 1), device=dev, dtype=torch.long)
-                return HelmholtzFieldDiagnostics(
-                    delta_pmc=delta_pmc,
-                    div_v=zero_scalar,
-                    eta_curl=torch.ones_like(zero_scalar),
-                    active_experts=empty_idx,
-                    active_weights=zero_scalar.unsqueeze(-1),
-                    max_resonance=zero_scalar,
-                    eta_harmonic=zero_scalar,
-                )
-
-            u_unit = torch.cat(u_atlas_list, dim=0)
-            v_all = torch.cat(v_atlas_list, dim=0)
-            cand_eids = torch.cat(eids_atlas_list, dim=0)
-            is_bridge_all = torch.cat(bridge_flag_list, dim=0)
-
-            sim = torch.matmul(q_unit, u_unit.t())
-            if puncture_dropout_prob > 0.0:
-                drop_mask = torch.rand_like(sim) < float(puncture_dropout_prob)
-                sim = sim.masked_fill(drop_mask, -1e9)
-
-            k_top = min(8, cand_eids.numel())
-            top_sim, top_rel_idx = torch.topk(sim, k=k_top, dim=-1)
-            top_eids = cand_eids[top_rel_idx]
-            max_res = top_sim[:, 0]
-
-            sim_pos = F.relu(top_sim - SIMPLEX_3_BARYCENTER_PROJ * 0.25)
-            s_max = sim_pos.amax(dim=-1, keepdim=True).clamp_min(1e-6)
-            t_hermite = (sim_pos / s_max).clamp(0.0, 1.0)
-            e_hermite = sim_pos * (t_hermite * t_hermite * (3.0 - 2.0 * t_hermite))
-            w_l2 = F.normalize(e_hermite, p=2.0, dim=-1)
-
-            u_sel = u_unit[top_rel_idx]
-            v_sel = v_all[top_rel_idx]
-            bridge_sel = is_bridge_all[top_rel_idx].float()
-
-            res_envelope = top_sim.clamp(0.0, 1.0).pow(2)
-            interp_field = torch.sum((w_l2 * res_envelope).unsqueeze(-1) * v_sel, dim=1).view(orig_shape)
-            if puncture_expert_mask is not None or puncture_dropout_prob > 0.0:
-                delta_pmc = interp_field.to(q_in.dtype)
-            else:
-                # 零 .item() 同步阻塞：纯张量掩码融合 query_and_inject 与全图册单纯形插值场
-                is_zero_inject = delta_pmc.abs().amax(dim=-1, keepdim=True) <= 1e-6
-                blended = (0.5 * delta_pmc.float() + 0.5 * interp_field).to(q_in.dtype)
-                delta_pmc = torch.where(is_zero_inject, interp_field.to(q_in.dtype), blended)
-
-            uv_dot = (u_sel * v_sel).sum(dim=-1)
-            v_norm = v_sel.norm(dim=-1).clamp_min(1e-6)
-            cos_uv = (uv_dot / v_norm).clamp(-1.0, 1.0)
-            div_local = (w_l2 * res_envelope * uv_dot).sum(dim=-1)
-            eta_div_local = ((w_l2 * w_l2) * (cos_uv * cos_uv)).sum(dim=-1).clamp(0.0, 1.0)
-            eta_curl_local = 1.0 - eta_div_local
-            v_perp_norm = (v_sel - uv_dot.unsqueeze(-1) * u_sel).norm(dim=-1)
-            is_wormhole = ((bridge_sel > 0.5) | (v_perp_norm > 1.8)).float()
-            eta_harm_local = ((w_l2 * w_l2) * is_wormhole).sum(dim=-1).clamp(0.0, 1.0)
-
         return HelmholtzFieldDiagnostics(
             delta_pmc=delta_pmc,
-            div_v=div_local.view(B, T),
-            eta_curl=eta_curl_local.view(B, T),
-            active_experts=top_eids.view(B, T, k_top),
-            active_weights=w_l2.view(B, T, k_top),
-            max_resonance=max_res.view(B, T),
-            eta_harmonic=eta_harm_local.view(B, T),
+            div_v=hc["div_v"],
+            eta_curl=hc["eta_curl"],
+            active_experts=hc["active_experts"],
+            active_weights=hc["active_weights"],
+            max_resonance=hc["max_resonance"],
+            eta_harmonic=hc["eta_harmonic"],
         )
 
     @torch.no_grad()
@@ -707,16 +560,19 @@ class PMCManager(BKPManager):
         # 切向推进分量 (2.5 * v_tan) 在 Module 5 切空间正交化滤除法向分量后直接推动状态滑向 q_target！
         v_desired = 2.5 * v_tan - 0.65 * q_c
 
-        psi_heads = F.normalize(psi.view(N, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
-        u_cb = F.normalize(pkg.u_codebook.detach().float(), dim=-1)
-        v_cb = F.normalize(pkg.v_codebook.detach().float(), dim=-1)
+        # 100% 复用 BKPManager._standardize_subqueries 与 normalized_codebooks，确保 Kaczmarz 写入与测地圆读取共享同一子键流形坐标系！
+        q1_psi, q2_psi = self._standardize_subqueries(psi, update_center=False)
+        u_cb, v_cb = pkg.normalized_codebooks()
 
-        su = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 0, :], u_cb).mean(dim=1)
-        sv = torch.einsum("nhd,hkd->nhk", psi_heads[:, :, 1, :], v_cb).mean(dim=1)
+        su = torch.einsum("nhd,hkd->nhk", q1_psi.float(), u_cb.float()).mean(dim=1)
+        sv = torch.einsum("nhd,hkd->nhk", q2_psi.float(), v_cb.float()).mean(dim=1)
         r_star = su.argmax(dim=-1)
         c_star = sv.argmax(dim=-1)
         eids = r_star * pkg.grid_k + c_star
         dev = psi.device
+
+        # 构造与 query_and_inject 完全对齐的标准化球面查询向量 q_sphere_psi
+        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
 
         # 1. 向量化记录相邻时间步的测地流线转移边 (零循环)
         if N > 1:
@@ -734,7 +590,7 @@ class PMCManager(BKPManager):
 
         psi_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
         v_des_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
-        psi_sum.index_add_(0, inverse_indices, psi)
+        psi_sum.index_add_(0, inverse_indices, q_sphere_psi)
         v_des_sum.index_add_(0, inverse_indices, v_desired)
         inv_cnt = (1.0 / hit_counts.float()).unsqueeze(-1)
         psi_bar = F.normalize(psi_sum * inv_cnt, dim=-1)
@@ -754,14 +610,14 @@ class PMCManager(BKPManager):
             first_occ.index_copy_(0, inverse_indices[rev_idx], rev_idx)
             has_intra_u = torch.zeros(u_cnt, dtype=torch.bool, device=dev)
             has_intra_u.index_fill_(0, inverse_indices[intra_fork_mask], True)
-            psi_bar = torch.where(has_intra_u.unsqueeze(-1), psi[first_occ], psi_bar)
+            psi_bar = torch.where(has_intra_u.unsqueeze(-1), q_sphere_psi[first_occ], psi_bar)
             v_des_bar = torch.where(has_intra_u.unsqueeze(-1), v_desired[first_occ], v_des_bar)
             cos_v_u = F.cosine_similarity(v_old, v_des_bar, dim=-1)
 
         existing_mitosis_u = enable_auto_mitosis & (~is_empty_u) & (cos_v_u < SIMPLEX_2_GEODESIC_PROJ)
         direct_update_u = ~existing_mitosis_u
         return self._apply_batched_kaczmarz_and_mitosis(
-            pkg, unique_eids, inverse_indices, hit_counts, psi, v_desired, r_star,
+            pkg, unique_eids, inverse_indices, hit_counts, q_sphere_psi, v_desired, r_star,
             psi_bar, v_des_bar, u_old, v_old, is_empty_u, cos_v_u,
             direct_update_u, existing_mitosis_u, intra_fork_mask, first_occ,
             snap_rate, enable_auto_mitosis,
@@ -835,17 +691,26 @@ class PMCManager(BKPManager):
             )
             pkg.purity_r[upd_eids] = new_pur
 
-            if bool(upd_empty.any()):
-                emp_eids = upd_eids[upd_empty]
-                emp_psi_h = F.normalize(psi_d[upd_empty].view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
-                r_emp = torch.div(emp_eids, pkg.grid_k, rounding_mode="floor")
-                c_emp = emp_eids % pkg.grid_k
-                pkg.u_codebook.data[:, r_emp, :] = PMCPackage.rodrigues_geodesic_rotation(
-                    pkg.u_codebook.data[:, r_emp, :], emp_psi_h[:, :, 0, :].permute(1, 0, 2), step_fraction=0.5
-                )
-                pkg.v_codebook.data[:, c_emp, :] = PMCPackage.rodrigues_geodesic_rotation(
-                    pkg.v_codebook.data[:, c_emp, :], emp_psi_h[:, :, 1, :].permute(1, 0, 2), step_fraction=0.5
-                )
+            upd_psi_h = F.normalize(psi_d.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
+            r_upd = torch.div(upd_eids, pkg.grid_k, rounding_mode="floor")
+            c_upd = upd_eids % pkg.grid_k
+            # 空槽位首次写入时 step_fraction=1.0 直接对齐标准化子键，非空槽位按罗德里格斯步长同步旋转子键
+            sf_sub = torch.where(upd_empty, torch.ones_like(h_m), step_frac.squeeze(-1)).view(1, -1, 1)
+            u_cur_sub = F.normalize(pkg.u_codebook.data[:, r_upd, :].float(), dim=-1)
+            v_cur_sub = F.normalize(pkg.v_codebook.data[:, c_upd, :].float(), dim=-1)
+            u_tgt_sub = upd_psi_h[:, :, 0, :].permute(1, 0, 2)
+            v_tgt_sub = upd_psi_h[:, :, 1, :].permute(1, 0, 2)
+            cos_u = (u_cur_sub * u_tgt_sub).sum(dim=-1, keepdim=True).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            cos_v = (v_cur_sub * v_tgt_sub).sum(dim=-1, keepdim=True).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            th_u = torch.acos(cos_u) * sf_sub
+            th_v = torch.acos(cos_v) * sf_sub
+            wu_perp = F.normalize(u_tgt_sub - cos_u * u_cur_sub, dim=-1)
+            wv_perp = F.normalize(v_tgt_sub - cos_v * v_cur_sub, dim=-1)
+            pkg.u_codebook.data[:, r_upd, :] = F.normalize(torch.cos(th_u) * u_cur_sub + torch.sin(th_u) * wu_perp, dim=-1)
+            pkg.v_codebook.data[:, c_upd, :] = F.normalize(torch.cos(th_v) * v_cur_sub + torch.sin(th_v) * wv_perp, dim=-1)
+            pkg._u_cb_norm_cache = None
+            pkg._v_cb_norm_cache = None
+            self.vram_cache.invalidate_or_refresh(pkg, upd_eids)
 
         return self._apply_batched_mitosis_spawns(
             pkg, unique_eids, psi, v_desired, r_star, psi_bar, v_des_bar,
@@ -916,9 +781,15 @@ class PMCManager(BKPManager):
             pkg.activation_counts[target_eids] += 1
             pkg.purity_r[target_eids] = 1.0
             m_psi_h = F.normalize(m_psi.view(-1, BKP_NUM_HEADS, 2, BKP_SUBKEY_DIM), dim=-1)
-            pkg.v_codebook.data[:, target_cols, :] = PMCPackage.rodrigues_geodesic_rotation(
-                pkg.v_codebook.data[:, target_cols, :], m_psi_h[:, :, 1, :].permute(1, 0, 2), step_fraction=0.85
+            pkg.u_codebook.data[:, m_rows, :] = PMCPackage.rodrigues_geodesic_rotation(
+                pkg.u_codebook.data[:, m_rows, :], m_psi_h[:, :, 0, :].permute(1, 0, 2), step_fraction=1.0
             )
+            pkg.v_codebook.data[:, target_cols, :] = PMCPackage.rodrigues_geodesic_rotation(
+                pkg.v_codebook.data[:, target_cols, :], m_psi_h[:, :, 1, :].permute(1, 0, 2), step_fraction=1.0
+            )
+            pkg._u_cb_norm_cache = None
+            pkg._v_cb_norm_cache = None
+            self.vram_cache.invalidate_or_refresh(pkg, target_eids)
 
         updated_count = int(direct_update_u.sum()) + mitosis_count
         self.total_kaczmarz_snaps += updated_count

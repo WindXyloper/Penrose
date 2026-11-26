@@ -313,18 +313,21 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     out_after_exp = mgr.query_and_inject(q_probe).clone()
     expand_zero_err = float((out_before_exp - out_after_exp).abs().max().item())
     assert pkg.grid_k == 128 and expand_zero_err < 1e-6
-    assert int(pkg.stream_next_ptr[0, 0].item()) == 129, f"流线指针扩容重映射错误: {pkg.stream_next_ptr[0]}"
+    remapped_eid = int(pkg.stream_next_ptr[0, 0].item())
+    assert remapped_eid == 129, f"流线指针扩容重映射错误: {pkg.stream_next_ptr[0]}"
 
-    # 构造双簇激活触发 Auto-Split (128 -> SubA + SubB + BridgeAB)
+    # 构造非对称双簇激活 (20x20 小簇 + 88x88 大簇) 触发 Auto-Split (128 -> 非对称 64 + 128 + BridgeAB)
     pkg.activation_counts.zero_()
-    pkg.activation_counts.view(128, 128)[:16, :16] = 10
-    pkg.activation_counts.view(128, 128)[64:80, 64:80] = 10
-    # 写入一个跨簇非对角桥接微专家 (row=0, col=64 -> eid=64)，使 Auto-Split 同时抽取出联络桥 BridgeAB.pmc
-    pkg.quantize_write_expert_page(64, q_a, q_b * 6.0, hit_increment=2.0, purity_val=0.95)
+    pkg.activation_counts.view(128, 128)[:20, :20] = 15
+    pkg.activation_counts.view(128, 128)[20:108, 20:108] = 10
+    # 写入一个跨簇非对角桥接微专家 (row=0, col=30 -> eid=30)，使 Auto-Split 走完整 SVD 非对称谱切分并抽取出联络桥 BridgeAB.pmc
+    pkg.quantize_write_expert_page(30, q_a, q_b * 6.0, hit_increment=2.0, purity_val=0.95)
     ev_split = mgr.step_autonomous_forest_evolution(step=2, q_probe=q_probe)
     assert any(e["op"] == "Auto-Split" for e in ev_split)
     assert all(isinstance(p, PMCPackage) for p in mgr.mounted_packages)
     assert any(p.is_bridge_pkg for p in mgr.mounted_packages), "Auto-Split 应当抽取出跨板块联络桥 BridgeAB.pmc！"
+    non_bridge_ks = sorted([p.grid_k for p in mgr.mounted_packages if not p.is_bridge_pkg])
+    assert non_bridge_ks == [64, 128], f"非对称谱双聚类切分应当将 (20x20, 88x88) 向上补齐为 [64, 128] 而非中位数对半切分，实际: {non_bridge_ks}"
 
     # 验证多坐标卡图册（SubA + SubB + BridgeAB）联合单纯形查询、霍奇第三项 eta_harmonic 与母体超球面共振归属路由
     diag_atlas = mgr.query_with_helmholtz_diagnostics(q_probe)
@@ -364,8 +367,9 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     snap = mgr.snapshot_forest_state(step=4)
     res = {
         "all_packages_are_pmc": all(isinstance(p, PMCPackage) for p in mgr.mounted_packages),
-        "stream_ptr_remapped_eid": int(pkg.stream_next_ptr[0, 0].item()),
+        "stream_ptr_remapped_eid": remapped_eid,
         "expand_zero_step_err": round(expand_zero_err, 8),
+        "asymmetric_split_grid_ks": non_bridge_ks,
         "eta_harmonic_max": round(float(diag_atlas.eta_harmonic.max().item()), 6),
         "routed_chart_id": routed_chart.pkg_id,
         "operator_totals": snap["operator_totals"],
@@ -376,6 +380,7 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
 
 
 if __name__ == "__main__":
+    import gc
     import os
     from train_penrose_v1 import run_penrose_v1_training
 
@@ -385,6 +390,9 @@ if __name__ == "__main__":
     r4 = test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity()
     r5 = test_manifold_puncture_dropout_c1_simplex_healing()
     r6 = test_six_autonomous_forest_operators_and_wormhole_switch()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     train_rep = run_penrose_v1_training(steps=15)
 
     full_report = {

@@ -52,10 +52,10 @@
     "module2_layers": 6,
     "module4_layers": 6,
     "module1_psi0_norm_err": 6e-08,
-    "module1_prefetched_pages": 24,
-    "module5_tangent_orthogonality_err": 1.5e-07,
+    "module1_prefetched_pages": 23,
+    "module5_tangent_orthogonality_err": 1.2e-07,
     "module5_q_next_norm_err": 6e-08,
-    "branch_c_chord_loss": 0.999638,
+    "branch_c_chord_loss": 0.998645,
     "tri_state_branch_trace": [
       "branch_a_curl_loop",
       "branch_a_curl_loop",
@@ -64,10 +64,10 @@
   },
   "exp4_adamw_free_kaczmarz_and_dirty_shell": {
     "pmc_optimizer_memory_bytes": 0,
-    "doc1_loss_before_to_after": "0.9905 -> 0.3584",
-    "doc2_loss_before_to_after": "0.8473 -> 0.5077",
-    "total_kaczmarz_snaps": 35,
-    "total_mitosis_spawns": 12,
+    "doc1_loss_before_to_after": "1.0022 -> 0.5071",
+    "doc2_loss_before_to_after": "0.7920 -> 0.4011",
+    "total_kaczmarz_snaps": 32,
+    "total_mitosis_spawns": 9,
     "clean_query_json_leakage": false
   },
   "exp5_manifold_puncture_c1_simplex_healing": {
@@ -78,12 +78,18 @@
       3
     ],
     "c1_simplex_healing_cosine": 0.999977,
-    "healed_to_true_field_cosine": 0.999681
+    "healed_to_true_field_cosine": 0.999679
   },
   "exp6_six_autonomous_forest_ops_and_wormhole": {
     "all_packages_are_pmc": true,
     "stream_ptr_remapped_eid": 129,
     "expand_zero_step_err": 0.0,
+    "asymmetric_split_grid_ks": [
+      64,
+      128
+    ],
+    "eta_harmonic_max": 1.0,
+    "routed_chart_id": "ForestSeed_SubB_s2.pmc",
     "operator_totals": {
       "split_count": 1,
       "expand_count": 1,
@@ -96,29 +102,28 @@
     "wormhole_mitosis_switches": 1
   },
   "end_to_end_training_15steps": {
-    "architecture": "Penrose-v1.0 (MPU + PMC + Harness)",
+    "architecture": "Penrose-v1.0 (MPU-2048 + PMC + Harness)",
+    "d_model": 512,
     "vocab_size": 0,
     "pmc_optimizer_memory_bytes": 0,
     "steps": 15,
-    "elapsed_sec": 36.294,
+    "elapsed_sec": 20.273,
     "history": [
       {
         "step": 1,
-        "num_wavepackets": 32,
-        "loss_before": 0.91628,
-        "loss_after": 0.266776,
+        "num_wavepackets": 34,
+        "loss": 0.141333,
         "active_pages": 35,
-        "mitosis_spawns": 9,
+        "mitosis_spawns": 5,
         "closure_count": 0,
         "forest_events": []
       },
       {
         "step": 5,
-        "num_wavepackets": 32,
-        "loss_before": 0.452827,
-        "loss_after": 0.803383,
-        "active_pages": 4272,
-        "mitosis_spawns": 52,
+        "num_wavepackets": 35,
+        "loss": 0.143839,
+        "active_pages": 4270,
+        "mitosis_spawns": 27,
         "closure_count": 64,
         "forest_events": [
           {
@@ -126,7 +131,7 @@
             "op": "Auto-Spawn",
             "new_pkg": "Spec_general_1_s5.pmc",
             "domain": "general",
-            "low_hit_ratio": 0.3644,
+            "low_hit_ratio": 0.8788,
             "grid_k": 64
           },
           {
@@ -140,11 +145,10 @@
       {
         "step": 10,
         "num_wavepackets": 37,
-        "loss_before": 0.472533,
-        "loss_after": 0.406272,
-        "active_pages": 4045,
-        "mitosis_spawns": 149,
-        "closure_count": 384,
+        "loss": 0.313423,
+        "active_pages": 3910,
+        "mitosis_spawns": 78,
+        "closure_count": 192,
         "forest_events": [
           {
             "step": 10,
@@ -152,7 +156,7 @@
             "parent_pkg": "Spec_general_1_s5.pmc",
             "child_a": "Spec_general_1_s5_SubA_s10.pmc",
             "child_b": "Spec_general_1_s5_SubB_s10.pmc",
-            "bridge_pkg": "Spec_general_1_s5_BridgeAB_s10.pmc",
+            "bridge_pkg": null,
             "grid_k": "128 -> (64, 64)"
           },
           {
@@ -160,29 +164,16 @@
             "op": "Auto-Closure",
             "pkg_id": "Base_v1.pmc",
             "crystallized_count": 64
-          },
-          {
-            "step": 10,
-            "op": "Auto-Closure",
-            "pkg_id": "Spec_general_1_s5_SubA_s10.pmc",
-            "crystallized_count": 64
-          },
-          {
-            "step": 10,
-            "op": "Auto-Closure",
-            "pkg_id": "Spec_general_1_s5_SubB_s10.pmc",
-            "crystallized_count": 64
           }
         ]
       },
       {
         "step": 15,
         "num_wavepackets": 20,
-        "loss_before": 0.403896,
-        "loss_after": 0.301242,
-        "active_pages": 4196,
-        "mitosis_spawns": 208,
-        "closure_count": 512,
+        "loss": 0.451104,
+        "active_pages": 3981,
+        "mitosis_spawns": 135,
+        "closure_count": 256,
         "forest_events": [
           {
             "step": 15,
@@ -190,14 +181,8 @@
             "pkg_a": "Base_v1.pmc",
             "pkg_b": "Spec_general_1_s5_SubB_s10.pmc",
             "merged_pkg": "TriadicMerge_1_s15.pmc",
-            "coactivation_ratio": 0.9406,
+            "coactivation_ratio": 1.0,
             "new_grid_k": 128
-          },
-          {
-            "step": 15,
-            "op": "Auto-Closure",
-            "pkg_id": "Spec_general_1_s5_SubA_s10.pmc",
-            "crystallized_count": 64
           },
           {
             "step": 15,

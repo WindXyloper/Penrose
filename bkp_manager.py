@@ -1243,35 +1243,27 @@ class BKPPackage(nn.Module):
         """
         k = self.grid_k
         c_mat = self.activation_counts.view(k, k).float()
-        sv_2d = self.scales[:, 1].view(k, k)
         total_act = c_mat.sum().item()
         if total_act <= 0:
             return None
 
-        split_r, split_c = k // 2, k // 2
-        q_r, q_c = max(1, split_r // 2), max(1, split_c // 2)
+        if True:
+            # 仅提取拥有实质激活的行与列子图 (剥离全零空白死区行列，杜绝零度孤立点干扰拉普拉斯谱分解与虚增子包尺寸)
+            act_r_idx = torch.nonzero(c_mat.sum(dim=1) > 0, as_tuple=False).squeeze(-1)
+            act_c_idx = torch.nonzero(c_mat.sum(dim=0) > 0, as_tuple=False).squeeze(-1)
+            r_act_n = int(act_r_idx.numel())
+            c_act_n = int(act_c_idx.numel())
+            if r_act_n < 4 or c_act_n < 4:
+                return None
 
-        outside_bridge = torch.ones((k, k), dtype=torch.bool, device=c_mat.device)
-        outside_bridge[:split_r, :split_c] = False
-        outside_bridge[split_r:, split_c:] = False
-        outside_bridge[:q_r, split_c : split_c + q_c] = False
-        outside_bridge[split_r : split_r + q_r, :q_c] = False
-        woken_outside = int(((c_mat > 0) & (sv_2d > 2e-5) & outside_bridge).sum().item())
-        if k >= 128 and woken_outside == 0:
-            if (
-                float(c_mat[:split_r, :split_c].sum().item()) <= 0.0
-                or float(c_mat[split_r:, split_c:].sum().item()) <= 0.0
-            ):
-                return None
-            diag_act = c_mat[:split_r, :split_c].sum() + c_mat[split_r:, split_c:].sum()
-            cross_ratio = float(1.0 - (diag_act / total_act).item())
-            if cross_ratio > cross_ratio_threshold:
-                return None
-        else:
-            deg_r = c_mat.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            deg_c = c_mat.sum(dim=0, keepdim=True).clamp(min=1e-6)
+            inact_r_idx = torch.nonzero(c_mat.sum(dim=1) <= 0, as_tuple=False).squeeze(-1)
+            inact_c_idx = torch.nonzero(c_mat.sum(dim=0) <= 0, as_tuple=False).squeeze(-1)
+
+            c_sub = c_mat[act_r_idx][:, act_c_idx]
+            deg_r = c_sub.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            deg_c = c_sub.sum(dim=0, keepdim=True).clamp(min=1e-6)
             d_r, d_c = deg_r.rsqrt(), deg_c.rsqrt()
-            norm_c = d_r * c_mat * d_c
+            norm_c = d_r * c_sub * d_c
 
             p_r = F.normalize(deg_r.sqrt(), p=2, dim=0)
             p_c = F.normalize(deg_c.sqrt(), p=2, dim=1).transpose(0, 1)
@@ -1281,35 +1273,87 @@ class BKPPackage(nn.Module):
             norm_c_perp = norm_c - (proj_c @ p_c.transpose(0, 1)) - (p_r @ proj_r) + scalar_rc * (p_r @ p_c.transpose(0, 1))
 
             u_svd, _, v_svd_t = torch.linalg.svd(norm_c_perp, full_matrices=False)
-            row_perm = torch.argsort(d_r.squeeze(1) * u_svd[:, 0])
-            col_perm = torch.argsort(d_c.squeeze(0) * v_svd_t[0, :])
+            f_r = d_r.squeeze(1) * u_svd[:, 0]
+            f_c = d_c.squeeze(0) * v_svd_t[0, :]
+            sub_r_perm = torch.argsort(f_r)
+            sub_c_perm = torch.argsort(f_c)
 
-            c_cand = c_mat[row_perm][:, col_perm]
-            diag_act = c_cand[:split_r, :split_c].sum() + c_cand[split_r:, split_c:].sum()
-            anti_act = c_cand[:split_r, split_c:].sum() + c_cand[split_r:, :split_c].sum()
-            if anti_act > diag_act:
-                col_perm = col_perm.flip(0)
-                c_cand = c_mat[row_perm][:, col_perm]
-                diag_act = c_cand[:split_r, :split_c].sum() + c_cand[split_r:, split_c:].sum()
+            c_cand = c_sub[sub_r_perm][:, sub_c_perm]
+            mid_r, mid_c = r_act_n // 2, c_act_n // 2
+            if (c_cand[:mid_r, mid_c:].sum() + c_cand[mid_r:, :mid_c].sum()) > (
+                c_cand[:mid_r, :mid_c].sum() + c_cand[mid_r:, mid_c:].sum()
+            ):
+                sub_c_perm = sub_c_perm.flip(0)
+                f_c = -f_c
+                c_cand = c_sub[sub_r_perm][:, sub_c_perm]
 
-            cross_ratio = float(1.0 - (diag_act / total_act).item())
+            # 非对称谱双聚类切分 (Asymmetric Cheeger / Conductance Minimum Sweep):
+            # 在剥离空白死区后的活跃子图 (r_act_n x c_act_n) 上扫描真实非对称切分点 (sr, sc)
+            prefix = torch.zeros((r_act_n + 1, c_act_n + 1), dtype=torch.float32, device=c_mat.device)
+            prefix[1:, 1:] = c_cand.cumsum(dim=0).cumsum(dim=1)
+            min_r_m = max(2, r_act_n // 16)
+            min_c_m = max(2, c_act_n // 16)
+            min_cluster_act = 0.03 * total_act
+
+            r_zero = int((f_r[sub_r_perm] < 0).sum().item())
+            c_zero = int((f_c[sub_c_perm] < 0).sum().item())
+            step_r = max(1, r_act_n // 32)
+            step_c = max(1, c_act_n // 32)
+            r_cands = sorted(set(
+                list(range(min_r_m, r_act_n - min_r_m + 1, step_r))
+                + [max(min_r_m, min(r_act_n - min_r_m, r_zero)), r_act_n // 2]
+            ))
+            c_cands = sorted(set(
+                list(range(min_c_m, c_act_n - min_c_m + 1, step_c))
+                + [max(min_c_m, min(c_act_n - min_c_m, c_zero)), c_act_n // 2]
+            ))
+
+            best_score = float("inf")
+            best_cross_ratio = 1.0
+            best_sr, best_sc = r_act_n // 2, c_act_n // 2
+            for sr in r_cands:
+                for sc in c_cands:
+                    act_aa = float(prefix[sr, sc].item())
+                    act_bb = float((prefix[r_act_n, c_act_n] - prefix[sr, c_act_n] - prefix[r_act_n, sc] + prefix[sr, sc]).item())
+                    if act_aa < min_cluster_act or act_bb < min_cluster_act:
+                        continue
+                    diag_cur = act_aa + act_bb
+                    cross_cur = max(0.0, float(total_act - diag_cur))
+                    cr_cur = cross_cur / total_act
+                    ncut = cross_cur * (1.0 / act_aa + 1.0 / act_bb)
+                    if ncut < best_score:
+                        best_score = ncut
+                        best_cross_ratio = cr_cur
+                        best_sr, best_sc = sr, sc
+
+            split_r, split_c = best_sr, best_sc
+            end_r, end_c = r_act_n, c_act_n
+            q_r = max(1, min(split_r, end_r - split_r) // 2)
+            q_c = max(1, min(split_c, end_c - split_c) // 2)
+            cross_ratio = best_cross_ratio
             if cross_ratio > cross_ratio_threshold:
                 return None
 
-            r_a, r_b = row_perm[:split_r], row_perm[split_r:]
-            c_a, c_b = col_perm[:split_c], col_perm[split_c:]
+            ord_act_r = act_r_idx[sub_r_perm]
+            ord_act_c = act_c_idx[sub_c_perm]
+            r_a, r_b = ord_act_r[:split_r], ord_act_r[split_r:]
+            c_a, c_b = ord_act_c[:split_c], ord_act_c[split_c:]
             ra_cross = c_mat[r_a][:, c_b].sum(dim=1)
             rb_cross = c_mat[r_b][:, c_a].sum(dim=1)
             ca_cross = c_mat[r_b][:, c_a].sum(dim=0)
             cb_cross = c_mat[r_a][:, c_b].sum(dim=0)
             if float((ra_cross.sum() + rb_cross.sum()).item()) > 0.0:
-                row_perm = torch.cat([r_a[torch.argsort(ra_cross, descending=True)], r_b[torch.argsort(rb_cross, descending=True)]], dim=0)
-                col_perm = torch.cat([c_a[torch.argsort(ca_cross, descending=True)], c_b[torch.argsort(cb_cross, descending=True)]], dim=0)
+                ord_act_r = torch.cat([r_a[torch.argsort(ra_cross, descending=True)], r_b[torch.argsort(rb_cross, descending=True)]], dim=0)
+                ord_act_c = torch.cat([c_a[torch.argsort(ca_cross, descending=True)], c_b[torch.argsort(cb_cross, descending=True)]], dim=0)
 
+            row_perm = torch.cat([ord_act_r, inact_r_idx], dim=0) if inact_r_idx.numel() > 0 else ord_act_r
+            col_perm = torch.cat([ord_act_c, inact_c_idx], dim=0) if inact_c_idx.numel() > 0 else ord_act_c
             self.permute_rows_cols(row_perm, col_perm)
 
+        end_r = locals().get("end_r", k)
+        end_c = locals().get("end_c", k)
         pkg_a = self.extract_padded_subpackage(f"{self.pkg_id}_partA", torch.arange(0, split_r), torch.arange(0, split_c))
-        pkg_b = self.extract_padded_subpackage(f"{self.pkg_id}_partB", torch.arange(split_r, k), torch.arange(split_c, k))
+        pkg_b = self.extract_padded_subpackage(f"{self.pkg_id}_partB", torch.arange(split_r, end_r), torch.arange(split_c, end_c))
 
         if not return_bridge:
             if cross_ratio > 1e-5:
@@ -2185,18 +2229,14 @@ class BKPManager(nn.Module):
         s2 = torch.einsum("nhd,hkd->nhk", q2.float(), v_keys.float())
         sv_2d = pkg.scales[:, 1].view(k_p, k_p)
         mature_2d = sv_2d > 2e-5
-        has_mature = mature_2d.any()
-        if pkg.is_base_pkg and len(self.l1_active_pkg_ids) <= 1:
-            scales_v_2d = sv_2d > 0
-            has_any_sv = scales_v_2d.any()
-            all_true = torch.ones(k_p, dtype=torch.bool, device=q1.device)
-            fallback_r = torch.where(has_any_sv, scales_v_2d.any(dim=1), all_true)
-            fallback_c = torch.where(has_any_sv, scales_v_2d.any(dim=0), all_true)
-            valid_r = torch.where(has_mature, mature_2d.any(dim=1), fallback_r)
-            valid_c = torch.where(has_mature, mature_2d.any(dim=0), fallback_c)
-        else:
-            valid_r = mature_2d.any(dim=1)
-            valid_c = mature_2d.any(dim=0)
+        vr_mat = mature_2d.any(dim=1)
+        vc_mat = mature_2d.any(dim=0)
+        base_64_mask = torch.zeros(k_p, dtype=torch.bool, device=q1.device)
+        base_64_mask[: min(64, k_p)] = True
+        # 当成熟行/列 >= 8 时严格锚定成熟行/列；当刚写入少量微专家 (< 8) 时锚定前 64 个基础正交子键，
+        # 既避免 1~2 行自减均值归零，又保证 64->128 四象限扩容瞬间背景 mu/std/tau_z 100% 不变 (扩容零误差 = 0.0000)！
+        valid_r = torch.where(vr_mat.sum() >= 8, vr_mat, base_64_mask | vr_mat)
+        valid_c = torch.where(vc_mat.sum() >= 8, vc_mat, base_64_mask | vc_mat)
         return s1, s2, valid_r, valid_c
 
     def _route_tile_block(
@@ -2352,28 +2392,21 @@ class BKPManager(nn.Module):
         k_head = min(self.cfg.head_top_k, k_sub * k_sub)
         gated_excess, best_pos = torch.topk(flat_excess, k=k_head, dim=-1)
         best_ids = torch.gather(flat_ids, dim=-1, index=best_pos)
-        goalkeeper_64 = (
-            gated_excess[:, :, -1]
-            if k_head >= self.cfg.head_top_k
-            else torch.full((N, BKP_NUM_HEADS), -1.0, device=dev)
-        )
-        return best_ids, gated_excess, goalkeeper_64
+        return best_ids, gated_excess
 
     def _route_single_package(
         self,
         pkg: BKPPackage,
         q1: torch.Tensor,
         q2: torch.Tensor,
-        base_64th_excess: Optional[torch.Tensor] = None,
         precomputed_scores: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         ambient_stats: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         对单个知识包在统一环境空间测地圆标尺下执行 O(K_p) 寻址与局部峰值包容:
         返回:
         - cand_ids: (N, 8, k_cand) 候选微专家一维页号 m = i * K_p + j
-        - cand_excess: (N, 8, k_cand) 超额无偏标准化得分
-        - base_goalkeeper: (N, 8) 若当前为 Base.bkp，返回每个头的守门员无偏得分
+        - cand_excess: (N, 8, k_cand) 超额无偏标准化得分 (相对于冈贝尔极值底线 tau_z_eff)
         """
         N = q1.shape[0]
         k_p = pkg.grid_k
@@ -2421,8 +2454,15 @@ class BKPManager(nn.Module):
             )
 
         if k_p == 128:
+            sv_2d = pkg.scales[:, 1].view(128, 128)
+            has_quad234 = bool((sv_2d[64:, :] > 0).any() or (sv_2d[:, 64:] > 0).any())
+            if not has_quad234:
+                # 四象限倍增扩容后新增的三个象限仍全为空白 (scale_v == 0)：
+                # 严格原位路由左上存量象限 [:64, :64]，保证扩容瞬间前向输出误差严格为 0.000000！
+                return self._route_tile_block(
+                    pkg, s1[:, :, :64], s2[:, :, :64], 0, 0, mu_r, mu_c, std_r, std_c, tau_z_sub, is_pkg_rw_train
+                )
             if pkg._sparse_128_triblock_mode is None:
-                sv_2d = pkg.scales[:, 1].view(128, 128)
                 outside_br = torch.ones((128, 128), dtype=torch.bool, device=q1.device)
                 outside_br[:64, :64] = False
                 outside_br[64:, 64:] = False
@@ -2430,14 +2470,14 @@ class BKPManager(nn.Module):
                 outside_br[64:96, :32] = False
                 pkg._sparse_128_triblock_mode = not bool((sv_2d > 0)[outside_br].any().item())
             if pkg._sparse_128_triblock_mode:
-                id_aa, ex_aa, gk_aa = self._route_tile_block(
+                id_aa, ex_aa = self._route_tile_block(
                     pkg, s1[:, :, :64], s2[:, :, :64], 0, 0, mu_r, mu_c, std_r, std_c, tau_z_sub, is_pkg_rw_train
                 )
-                id_bb, ex_bb, _ = self._route_tile_block(
+                id_bb, ex_bb = self._route_tile_block(
                     pkg, s1[:, :, 64:], s2[:, :, 64:], 64, 64, mu_r, mu_c, std_r, std_c, tau_z_sub, is_pkg_rw_train
                 )
                 br_map = torch.cat([torch.arange(0, 32, device=q1.device), torch.arange(64, 96, device=q1.device)])
-                id_br, ex_br, _ = self._route_tile_block(
+                id_br, ex_br = self._route_tile_block(
                     pkg,
                     s1[:, :, br_map],
                     s2[:, :, br_map],
@@ -2451,7 +2491,7 @@ class BKPManager(nn.Module):
                     is_pkg_rw_train,
                     is_bridge_tile=True,
                 )
-                return torch.cat([id_aa, id_bb, id_br], dim=-1), torch.cat([ex_aa, ex_bb, ex_br], dim=-1), gk_aa
+                return torch.cat([id_aa, id_bb, id_br], dim=-1), torch.cat([ex_aa, ex_bb, ex_br], dim=-1)
 
         return self._route_tile_block(
             pkg, s1, s2, 0, 0, mu_r, mu_c, std_r, std_c, tau_z_sub, is_pkg_rw_train, is_bridge_tile=False
@@ -2471,7 +2511,7 @@ class BKPManager(nn.Module):
         for _, pkg in self.packages.items():
             if pkg.pkg_id in self.l1_active_pkg_ids:
                 continue
-            _, cand_excess, _ = self._route_single_package(pkg, q1, q2)
+            _, cand_excess = self._route_single_package(pkg, q1, q2)
             if bool((cand_excess > 0).any().item()):
                 self.mount_package(pkg, pin_to_l1=True)
                 promoted.append(pkg.pkg_id)
@@ -2480,30 +2520,49 @@ class BKPManager(nn.Module):
     def query_and_inject(
         self,
         q_bkp: torch.Tensor,
+        puncture_dropout_prob: float = 0.0,
+        puncture_expert_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         腰部总线核心调用接口:
         输入 q_bkp: (B, T, 2048) -> 输出注入残差流的知识脉冲 delta_z_bkp: (B, T, 2048)
+        同时原生产出基于测地圆半径与 L2 能量守恒单位分解的亥姆霍兹/霍奇三分解场诊断缓存 self._last_helmholtz_cache。
         """
+        if q_bkp.dim() == 2:
+            B, T = q_bkp.shape[0], 1
+        else:
+            B, T = q_bkp.shape[0], q_bkp.shape[1]
+        N = B * T
+        dev = q_bkp.device
+
         if len(self.l1_active_pkg_ids) == 0:
+            zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
+            self._last_helmholtz_cache = {
+                "div_v": zero_scalar,
+                "eta_curl": torch.ones_like(zero_scalar),
+                "eta_harmonic": zero_scalar,
+                "active_experts": torch.zeros((B, T, 1), device=dev, dtype=torch.long),
+                "active_weights": zero_scalar.unsqueeze(-1),
+                "max_resonance": zero_scalar,
+            }
             return torch.zeros_like(q_bkp)
 
-        B, T, _ = q_bkp.shape
-        N = B * T
         q_flat = q_bkp.reshape(N, D_BKP)
 
         # 仅在"可写训练态 + 梯度开启 + 码本可训练 (寻址坐标系构建期)"时收集查询锥 EMA 统计量：
         # 一旦读取层与码本冻结 (u_codebook.requires_grad=False)，查询锥中心同步锁死，严防读取信号漂移
         base_pkg: Optional[BKPPackage] = self._get_reference_manifold_pkg()
         collect_center_stats = bool(
-            base_pkg is not None
+            self.training
+            and N >= 16
+            and base_pkg is not None
             and torch.is_grad_enabled()
             and base_pkg.u_codebook.requires_grad
             and base_pkg.mount_mode in (BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE)
         )
         q1, q2 = self._standardize_subqueries(q_flat, update_center=collect_center_stats)
 
-        # 1. 先路由常驻 Base.bkp 获取第 64 名守门员基准分，再路由其余活跃扩展包
+        # 1. 仅扫描驻留在 L1 快表 (l1_active_pkg_ids) 中的活跃坐标卡，绝不扫描未进 L1 的冷包
         ordered_pids: List[str] = []
         if self.base_pkg_id and self.base_pkg_id in self.l1_active_pkg_ids:
             ordered_pids.append(self.base_pkg_id)
@@ -2511,7 +2570,6 @@ class BKPManager(nn.Module):
             if pid not in ordered_pids and self._mod_key(pid) in self.packages:
                 ordered_pids.append(pid)
 
-        base_gk: Optional[torch.Tensor] = None
         pkg_routing_results: List[Tuple[int, BKPPackage, torch.Tensor, torch.Tensor]] = []
 
         # 同空间统一测地圆标尺 (Unified Ambient Geodesic Ball Metric) + 多包码本单次融合投影:
@@ -2544,8 +2602,12 @@ class BKPManager(nn.Module):
                 k_p = p.grid_k
                 sv_2d = p.scales[:, 1].view(k_p, k_p)
                 mature_2d = sv_2d > 2e-5
-                vr_p = mature_2d.any(dim=1)
-                vc_p = mature_2d.any(dim=0)
+                vr_mat = mature_2d.any(dim=1)
+                vc_mat = mature_2d.any(dim=0)
+                base_64_p = torch.zeros(k_p, dtype=torch.bool, device=q1.device)
+                base_64_p[: min(64, k_p)] = True
+                vr_p = torch.where(vr_mat.sum() >= 8, vr_mat, base_64_p | vr_mat)
+                vc_p = torch.where(vc_mat.sum() >= 8, vc_mat, base_64_p | vc_mat)
                 precomputed_list.append((p, s1_p, s2_p, vr_p, vc_p))
                 if not p.is_bridge_pkg:
                     valid_s1_chunks.append((s1_p, vr_p))
@@ -2571,22 +2633,28 @@ class BKPManager(nn.Module):
             var_c_amb = (((s2_amb_all - mu_c_amb) * vc_f).pow(2).sum(dim=-1, keepdim=True) / cnt_c).clamp(min=1e-10)
             std_r_amb = (torch.sqrt(var_r_amb) / q1_std).clamp(min=1e-5).detach()
             std_c_amb = (torch.sqrt(var_c_amb) / q2_std).clamp(min=1e-5).detach()
-            n_grid_amb = max(4.0, float(s1_amb_all.shape[-1]) / max(1e-9, self.cfg.alpha_0))
+            eff_k_amb = float(max(cnt_r.max().item(), cnt_c.max().item(), 64.0))
+            n_grid_amb = max(4.0, eff_k_amb / max(1e-9, self.cfg.alpha_0))
             tau_z_amb = closed_form_gumbel_threshold(n_grid_amb)
             ambient_stats = (mu_r_amb, mu_c_amb, std_r_amb, std_c_amb, tau_z_amb)
 
         for p_idx, (pkg, s1_p, s2_p, vr_p, vc_p) in enumerate(precomputed_list):
-            c_ids, c_excess, gk = self._route_single_package(
+            c_ids, c_excess = self._route_single_package(
                 pkg,
                 q1,
                 q2,
-                base_64th_excess=base_gk,
                 precomputed_scores=(s1_p, s2_p, vr_p, vc_p),
                 ambient_stats=ambient_stats,
             )
-            if pkg.is_base_pkg:
-                base_gk = gk
-            pkg_routing_results.append((p_idx, pkg, c_ids, c_excess))
+            if puncture_expert_mask is not None and puncture_expert_mask.numel() == pkg.num_experts:
+                p_mask_dev = puncture_expert_mask.to(c_ids.device)
+                c_excess = c_excess.masked_fill(p_mask_dev[c_ids.clamp(0, pkg.num_experts - 1)], -1e9)
+            if puncture_dropout_prob > 0.0:
+                drop_m = torch.rand_like(c_excess) < float(puncture_dropout_prob)
+                c_excess = c_excess.masked_fill(drop_m, -1e9)
+            # 包级零激活短路秒筛: 若该包没有任何微专家跨过冈贝尔极值底线 tau_z_eff，直接旁路跳过，0 页拉取！
+            if bool((c_excess > 0.0).any()):
+                pkg_routing_results.append((p_idx, pkg, c_ids, c_excess))
 
         # 若所有包均未过线 (Zero-Activation Short-Circuit)，直接返回零张量，零访存开销
         if len(pkg_routing_results) == 0:
@@ -2600,6 +2668,15 @@ class BKPManager(nn.Module):
                 if getattr(base_pkg, "_pending_post_cone_batch_mean", None) is not None:
                     base_pkg.update_query_post_cone_center(base_pkg._pending_post_cone_batch_mean)
                     base_pkg._pending_post_cone_batch_mean = None
+            zero_scalar = torch.zeros((B, T), device=dev, dtype=torch.float32)
+            self._last_helmholtz_cache = {
+                "div_v": zero_scalar,
+                "eta_curl": torch.ones_like(zero_scalar),
+                "eta_harmonic": zero_scalar,
+                "active_experts": torch.zeros((B, T, 1), device=dev, dtype=torch.long),
+                "active_weights": zero_scalar.unsqueeze(-1),
+                "max_resonance": zero_scalar,
+            }
             return torch.zeros_like(q_bkp)
 
         # 2. 汇总过线候选并执行零点锚定动态归一化 (Zero-Anchored Softmax_1)
@@ -2616,7 +2693,7 @@ class BKPManager(nn.Module):
             s_exc, s_idx = torch.sort(flat_c_exc, dim=-1, descending=True)
             s_ids = torch.gather(flat_c_ids, dim=-1, index=s_idx)
             dup_m = (s_ids.unsqueeze(-1) == s_ids.unsqueeze(-2)).triu(diagonal=1).any(dim=-2)
-            dedup_exc = s_exc.masked_fill(dup_m, 0.0)
+            dedup_exc = s_exc.masked_fill(dup_m, -1e9)
             if H * K_c > k_cap:
                 p_exc, p_pos = torch.topk(dedup_exc, k=k_cap, dim=-1)
                 p_ids = torch.gather(s_ids, dim=-1, index=p_pos)
@@ -2752,6 +2829,11 @@ class BKPManager(nn.Module):
 
         # 3. 按包分组执行多头页号去重、VRAM LRU 缓存拉取与 Rank-1 微专家计算
         delta_z = torch.zeros((N, D_BKP), dtype=q_bkp.dtype, device=q_bkp.device)
+        div_accum = torch.zeros(N, dtype=torch.float32, device=dev)
+        eta_div_accum = torch.zeros(N, dtype=torch.float32, device=dev)
+        eta_harm_accum = torch.zeros(N, dtype=torch.float32, device=dev)
+        w2_accum = torch.zeros(N, dtype=torch.float32, device=dev)
+        max_res_accum = torch.zeros(N, dtype=torch.float32, device=dev)
         self.last_active_trace.clear()
         if do_sync_telemetry:
             self.last_pkg_slot_hits = {pkg.pkg_id: 0 for _, pkg, _, _ in pkg_routing_results}
@@ -2809,6 +2891,27 @@ class BKPManager(nn.Module):
             u_dequant = pages_int8[:, 0, :].to(q_bkp.dtype) * scales_fp16[:, 0:1].to(q_bkp.dtype)
             v_dequant = pages_int8[:, 1, :].to(q_bkp.dtype) * scales_fp16[:, 1:2].to(q_bkp.dtype)
 
+            # 原生累加当前激活包在测地圆半径内的亥姆霍兹/霍奇三分解统计量 (0 额外调页，100% 复用 u_dequant, v_dequant 与 L2 路由权重)
+            with torch.no_grad():
+                u_f = F.normalize(u_dequant.detach().float(), dim=-1)
+                v_f = v_dequant.detach().float()
+                uv_dot_u = (u_f * v_f).sum(dim=-1)  # (U_uniq,)
+                v_norm_u = v_f.norm(dim=-1).clamp_min(1e-6)
+                cos2_uv_u = (uv_dot_u / v_norm_u).clamp(-1.0, 1.0).pow(2)
+                v_perp_u = (v_f - uv_dot_u.unsqueeze(-1) * u_f).norm(dim=-1)
+                wormhole_u = ((v_perp_u > 1.8) | bool(pkg.is_bridge_pkg)).float()
+
+                w_f = local_weights.detach().float()
+                w2_f = w_f * w_f
+                div_accum.index_add_(0, token_indices, w_f * uv_dot_u[inverse_idx])
+                eta_div_accum.index_add_(0, token_indices, w2_f * cos2_uv_u[inverse_idx])
+                eta_harm_accum.index_add_(0, token_indices, w2_f * wormhole_u[inverse_idx])
+                w2_accum.index_add_(0, token_indices, w2_f)
+
+                q_tok_u = F.normalize(q_flat[token_indices].detach().float(), dim=-1)
+                sim_tok = (q_tok_u * u_f[inverse_idx]).sum(dim=-1).clamp(0.0, 1.0)
+                max_res_accum.scatter_reduce_(0, token_indices, sim_tok, reduce="amax", include_self=True)
+
             # 若该包处于可写训练态，对当前步被唤醒的稀疏微专家开启梯度追踪以支持局部悬置微调；
             # 若该包处于 RO_SYS 只读态但上游 Kernel 查询 q_bkp 处于训练态 (如跨核母语流形锚定)，
             # 则仅冻结 u_dequant/v_dequant，保留 local_weights 对 q_bkp 的路由梯度流！
@@ -2830,6 +2933,21 @@ class BKPManager(nn.Module):
                 q_rms, u_dequant, v_dequant, w_typed, token_indices, inverse_idx, scale_factor, 8192
             )
             delta_z.add_(delta_pkg)
+
+        with torch.no_grad():
+            w2_norm = w2_accum.clamp_min(1e-8)
+            eta_div_norm = (eta_div_accum / w2_norm).clamp(0.0, 1.0)
+            eta_curl_norm = 1.0 - eta_div_norm
+            eta_harm_norm = (eta_harm_accum / w2_norm).clamp(0.0, 1.0)
+            k_diag = min(8, top_gids.shape[-1])
+            self._last_helmholtz_cache = {
+                "div_v": div_accum.view(B, T),
+                "eta_curl": eta_curl_norm.view(B, T),
+                "eta_harmonic": eta_harm_norm.view(B, T),
+                "active_experts": (top_gids[:, :k_diag] & 0xFFFFFFFF).view(B, T, k_diag),
+                "active_weights": routing_weights[:, :k_diag].detach().float().view(B, T, k_diag),
+                "max_resonance": max_res_accum.view(B, T),
+            }
 
         # 逆流形同胚变换 T^{-1}: S -> M，将标准球面上的微专家合成响应映射回原语料流形的各向异性几何空间
         # 注意: 保幅比例因子 (pre_rms / post_rms) 采用 detach() 作为纯标量常数，防止 1/post_rms 求导抵消微专家方向梯度！
