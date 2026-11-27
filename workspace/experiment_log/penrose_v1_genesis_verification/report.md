@@ -28,9 +28,9 @@
 ### 3. `MPU` 五段式纯球面流水线与三态总线分支 (`exp3_mpu_five_module_and_tri_state_bus`)
 - **静态词表大小 (`vocab_size`)**: **`0`**
 - **流水线拓扑**: Module 1 (1-Jet Ingress) $\to$ Module 2 (前 6 层 8 头割线积分栈) $\to$ Module 3 (腰部 `PMC` 单位残差门) $\to$ Module 4 (后 6 层 8 头曲率精炼栈) $\to$ Module 5 (跨核球面 ResNet 切空间正交闭环)
-- **Module 1 $\psi^{(0)}(\tau)$ 单位球面范数误差**: **`6.0e-8`**（并在第 0 微秒自动触发异步预取 **`23`** 个微专家页）
-- **Module 5 切空间正交化误差 $\langle \Delta q_\perp(\tau), q(\tau)\rangle$**: **`2.3e-7`**
-- **Module 5 输出 $q(\tau+1)$ 单位球面范数误差**: **`6.0e-8`**
+- **Module 1 $\psi^{(0)}(\tau)$ 单位球面范数误差**: **`6.0e-8`**（并在第 0 微秒自动触发异步预取 **`24`** 个微专家页）
+- **Module 5 切空间正交化误差 $\langle \Delta q_\perp(\tau), q(\tau)\rangle$**: **`1.8e-7`**
+- **Module 5 输出 $q(\tau+1)$ 单位球面范数误差**: **`1.2e-7`**
 - **三态总线分支轨迹 (`tri_state_branch_trace`)**: `["branch_a_curl_loop", "branch_a_curl_loop", "branch_b_sink_emit"]`
 
 ### 4. 无 `AdamW` 的 Kaczmarz + 罗德里格斯大圆旋转一步锁死与逆向拖拽精准擦除 (`exp4_adamw_free_kaczmarz_and_dirty_shell`)
@@ -46,13 +46,13 @@
 
 ### 5. 流形穿孔邻域三次厄米特 $C^1$ 单纯形插值自愈 (`exp5_manifold_puncture_c1_simplex_healing`)
 - **硬性拔除中心微专家 (`punctured_center_eid`)**: `0`
-- **单纯形邻域伴随微专家 (`healed_top_neighbors`)**: `[1, 2, 3]`
-- **$C^1$ 单纯形邻域插值自愈余弦 (`c1_simplex_healing_cosine`)**: **`0.999977`**
-- **自愈场与真实目标场余弦 (`healed_to_true_field_cosine`)**: **`0.999679`**
+- **单纯形邻域伴随微专家 (`healed_top_neighbors`)**: `[1, 2, 3]`（真实自然语言词元 `"黎曼流形"` / `"黎曼几何"` / `"黎曼度规"` / `"黎曼曲率"` $\to$ `"测地线方程"`）
+- **$C^1$ 单纯形邻域插值自愈余弦 (`c1_simplex_healing_cosine`)**: **`0.999962`**
+- **自愈场与真实目标场余弦 (`healed_to_true_field_cosine`)**: **`0.999432`**
 
 ### 6. 六大森林自治算子、非对称谱双聚类、多坐标卡图册与霍奇三分解「拓扑虫洞道岔」 (`exp6_six_autonomous_forest_ops_and_wormhole`)
 - **所有衍生块类型均为 `PMCPackage` (`all_packages_are_pmc`)**: **`true`**
-- **四叉树扩容零步误差 (`expand_zero_step_err`)**: **`0.00000000`**
+- **四叉树扩容零步误差 (`expand_zero_step_err`)**: **`2.4e-7`**
 - **流线边自动重映射索引 (`stream_ptr_remapped_eid`)**: **`129`** (`(0,0) -> (1,1)` 在 `grid_k=128` 下精确映射为 $1 \times 128 + 1 = 129$)
 - **非对称谱双聚类切分规格 (`asymmetric_split_grid_ks`)**: **`[64, 128]`**（在剥离未激活空白死区后的活跃子图上执行最小归一化电导割扫描，将 $20 \times 20$ 与 $88 \times 88$ 双簇精确向上补齐为 $64 \times 64$ 与 $128 \times 128$，摒弃硬编码 `k // 2` 中点对半切分）
 - **多坐标卡图册 (`SubA.pmc` + `SubB.pmc` + `BridgeAB.pmc`) 霍奇调和流占比 (`eta_harmonic_max`)**: **`1.0`（实测验证 $\mathcal{H}^1(\mathcal{M})$ 非平凡调和虫洞分量激活，且 100% 复用 `BKPManager.query_and_inject` 三级测地线球路由实现零重复扫描）**
@@ -61,21 +61,21 @@
 - **验证思考回流触发 `Auto-Mitosis` 虫洞道岔分裂数 (`wormhole_mitosis_switches`)**: **`1`**（在同一子键行开辟伴随列构建直达虫洞，100% 保留原多步思考盘山公路）
 
 ### 7. 脏数据输入无时序分槽与 `Auto-Split` 独立分块 + 测地圆自然低唤醒 (`exp7_dirty_data_auto_split_and_low_wake`)
-- **微观真假输入无时序效应（Order Invariance）**:
+- **微观真假输入无时序效应（Order Invariance，真实词元 `"牛顿第二定律"` $\to$ `"加速度正比于合力"` vs `"永动机无中生有"`）**:
   - **「先喂 5 次真事实、后喂 1 次伪造篡改」分槽计数 (`order_invariance_counts_truth_first`)**: **`[5, 1]`**
   - **「先喂 1 次伪造篡改、后喂 5 次真事实」分槽计数 (`order_invariance_counts_fake_first`)**: **`[5, 1]`**
   - **两种相反输入时序下主干真微专家的恢复余弦差 (`order_invariance_truth_cosine_diff`)**: **`0.00000000`（证伪“先喂假数据会把流形带偏”的传统全连接网络缺陷）**
 - **宏观伪造词条簇 `Auto-Split` 自动划归独立 `.pmc` 块与测地圆自然静默（零新增算子，100% 复用现有机制）**:
   - **主干真实知识子包 (`split_clean_pmc_id`)**: `MixedCorpus_SubA_s1.pmc (grid_k=128)`
   - **自动剥离出的伪造脏数据孤岛子包 (`split_dirty_pmc_id`)**: `MixedCorpus_SubB_s1.pmc (grid_k=64)`
-  - **正常主干查询下主干块唤醒命中槽位数 (`clean_query_clean_pmc_slot_hits`)**: **`38`**
+  - **正常主干查询下主干块唤醒命中槽位数 (`clean_query_clean_pmc_slot_hits`)**: **`63`**
   - **正常主干查询下脏数据块唤醒命中槽位数 (`clean_query_dirty_pmc_slot_hits`)**: **`0`（因跨不过测地圆冈贝尔半径 $\tau_z^*$ 被包级零激活短路直接旁路，脏块误唤醒率 `0.0%`）**
 
 ### 8. `Penrose v1.0` 五维时间与空间复杂度标度律实测 (`exp8_five_dimensional_complexity_scaling`)
 - **维度 1 — 零词表 I/O 复杂度 $\mathcal{O}(d)$ (`dim1_vocab_size_and_transducer_params`)**: **`[0, 0]`**（词表大小 `0`，换能器参数量 `0`）
-- **维度 2 — 序列长度 $N$ 扩大 $8\times$（$64 \to 512$ 波包）的 $\mathcal{O}(N)$ 时间与 $\mathcal{O}(1)$ 状态显存**:
+- **维度 2 — 序列长度 $N$ 扩大 $8\times$（$64 \to 512$ 真实语料波包）的 $\mathcal{O}(N)$ 时间与 $\mathcal{O}(1)$ 状态显存**:
   - **跨窗口活跃状态显存比值 (`dim2_seq_len_8x_state_mem_ratio`)**: **`1.0000`（严格 $\mathcal{O}(1)$ 常数显存，彻底消除 $\mathcal{O}(N)$ KV Cache 线性膨胀）**
-  - **端到端流式耗时比值 (`dim2_seq_len_8x_time_ratio`)**: **`8.52x`（符合 $\mathcal{O}(N)$ 线性时间标度，彻底打破 $\mathcal{O}(N^2)$ 的 `64x` 二次方算力墙）**
+  - **端到端流式耗时比值 (`dim2_seq_len_8x_time_ratio`)**: **`7.69x`（符合 $\mathcal{O}(N)$ 线性时间标度，彻底打破 $\mathcal{O}(N^2)$ 的 `64x` 二次方算力墙）**
 - **维度 3 — 知识库微专家总数 $M_{\text{chunk}}$ 扩大 $16\times$（$4,096 \to 65,536$）的寻址复杂度**:
   - **微专家总数扩容倍数 (`dim3_experts_16x_scale_4096_to_65536`)**: **`16.0x`**
   - **冷启动乘积子键内积宽度增长倍数 (`dim3_cold_subkey_ops_scale_sqrt_m`)**: **`4.0x`（严格遵循 $\mathcal{O}(\sqrt{M_{\text{chunk}}})$ 笛卡尔双向子键分解律）**
@@ -89,8 +89,8 @@
   - **优化器动量显存占用 (`dim5_optimizer_memory_bytes`)**: **`0 Bytes`**
 
 ### 9. 15 步端到端免清洗拖拽流形训练 (`end_to_end_training_15steps`)
-- `Step 01`: `ChordLoss = 0.1615` | `ActivePMC = 35` | `Mitosis = 5` | `Closure = 0`
-- `Step 05`: `ChordLoss = 0.1871` | `ActivePMC = 4269` | `Mitosis = 27` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
-- `Step 10`: `ChordLoss = 0.3170` | `ActivePMC = 3916` | `Mitosis = 78` | `Closure = 192` | 触发 `Auto-Split (128 -> 64, 64)` + `Auto-Closure`
-- `Step 15`: `ChordLoss = 0.3510` | `ActivePMC = 3981` | `Mitosis = 126` | `Closure = 256` | 触发 `Auto-Merge (TriadicMerge_1_s15.pmc, coact=1.0)` + `Auto-Closure`
+- `Step 01`: `ChordLoss = 0.3956` | `ActivePMC = 34` | `Mitosis = 6` | `Closure = 0`
+- `Step 05`: `ChordLoss = 0.1595` | `ActivePMC = 4272` | `Mitosis = 25` | `Closure = 64` | 触发 `Auto-Spawn (Spec_general_1_s5.pmc)` + `Auto-Closure`
+- `Step 10`: `ChordLoss = 0.3266` | `ActivePMC = 4334` | `Mitosis = 56` | `Closure = 128` | 触发 `Auto-Merge (TriadicMerge_1_s10.pmc, coact=0.6818)` + `Auto-Closure`
+- `Step 15`: `ChordLoss = 0.1368` | `ActivePMC = 3740` | `Mitosis = 76` | `Closure = 256` | 触发 `Auto-Split (128 -> 64, 64 + BridgeAB)` + `Auto-Closure`
 

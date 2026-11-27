@@ -176,22 +176,10 @@ class PMCPackage(BKPPackage):
     def extract_padded_subpackage(self, sub_id: str, row_idx: torch.Tensor, col_idx: torch.Tensor) -> "PMCPackage":
         base_sub = super().extract_padded_subpackage(sub_id, row_idx, col_idx)
         dev = self.u_codebook.device
-        pmc_sub = PMCPackage(
-            pkg_id=base_sub.pkg_id,
-            grid_k=base_sub.grid_k,
-            mount_mode=base_sub.mount_mode,
-            is_base_pkg=base_sub.is_base_pkg,
-            device=dev,
-        )
-        pmc_sub._copy_manifold_stats_from(base_sub)
-        pmc_sub.codebook_pre_centered.copy_(base_sub.codebook_pre_centered)
-        pmc_sub._codebook_pre_centered_cached = base_sub._codebook_pre_centered_cached
-        pmc_sub.u_codebook.data.copy_(base_sub.u_codebook.data)
-        pmc_sub.v_codebook.data.copy_(base_sub.v_codebook.data)
-        pmc_sub.expert_pages_int8.copy_(base_sub.expert_pages_int8)
-        pmc_sub.scales.copy_(base_sub.scales)
-        pmc_sub.activation_counts.copy_(base_sub.activation_counts)
-        pmc_sub.purity_r.copy_(base_sub.purity_r)
+        base_sub.__class__ = PMCPackage
+        pmc_sub: PMCPackage = base_sub  # type: ignore[assignment]
+        pmc_sub.mount_mode = self.mount_mode
+        pmc_sub.to(dev)
         pmc_sub._rebuild_runtime_buffers_after_topology_change()
 
         k_old = self.grid_k
@@ -218,23 +206,11 @@ class PMCPackage(BKPPackage):
     @torch.no_grad()
     def bkp_merge_direct_sum(pkg_a: BKPPackage, pkg_b: BKPPackage, merged_id: str) -> "PMCPackage":
         base_merged = BKPPackage.bkp_merge_direct_sum(pkg_a, pkg_b, merged_id=merged_id)
-        dev = base_merged.u_codebook.device
-        pmc_merged = PMCPackage(
-            pkg_id=base_merged.pkg_id,
-            grid_k=base_merged.grid_k,
-            mount_mode=base_merged.mount_mode,
-            is_base_pkg=base_merged.is_base_pkg,
-            device=dev,
-        )
-        pmc_merged._copy_manifold_stats_from(base_merged)
-        pmc_merged.codebook_pre_centered.copy_(base_merged.codebook_pre_centered)
-        pmc_merged._codebook_pre_centered_cached = base_merged._codebook_pre_centered_cached
-        pmc_merged.u_codebook.data.copy_(base_merged.u_codebook.data)
-        pmc_merged.v_codebook.data.copy_(base_merged.v_codebook.data)
-        pmc_merged.expert_pages_int8.copy_(base_merged.expert_pages_int8)
-        pmc_merged.scales.copy_(base_merged.scales)
-        pmc_merged.activation_counts.copy_(base_merged.activation_counts)
-        pmc_merged.purity_r.copy_(base_merged.purity_r)
+        dev = pkg_a.u_codebook.device
+        base_merged.__class__ = PMCPackage
+        pmc_merged: PMCPackage = base_merged  # type: ignore[assignment]
+        pmc_merged.mount_mode = getattr(pkg_a, "mount_mode", PMCMountMode.RW_SHARED)
+        pmc_merged.to(dev)
         pmc_merged._rebuild_runtime_buffers_after_topology_change()
 
         km = pmc_merged.grid_k

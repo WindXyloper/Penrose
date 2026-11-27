@@ -52,10 +52,10 @@
     "module2_layers": 6,
     "module4_layers": 6,
     "module1_psi0_norm_err": 6e-08,
-    "module1_prefetched_pages": 23,
-    "module5_tangent_orthogonality_err": 2.3e-07,
-    "module5_q_next_norm_err": 6e-08,
-    "branch_c_chord_loss": 0.998834,
+    "module1_prefetched_pages": 24,
+    "module5_tangent_orthogonality_err": 1.8e-07,
+    "module5_q_next_norm_err": 1.2e-07,
+    "branch_c_chord_loss": 0.987449,
     "tri_state_branch_trace": [
       "branch_a_curl_loop",
       "branch_a_curl_loop",
@@ -81,13 +81,13 @@
       2,
       3
     ],
-    "c1_simplex_healing_cosine": 0.999977,
-    "healed_to_true_field_cosine": 0.999679
+    "c1_simplex_healing_cosine": 0.999962,
+    "healed_to_true_field_cosine": 0.999432
   },
   "exp6_six_autonomous_forest_ops_and_wormhole": {
     "all_packages_are_pmc": true,
     "stream_ptr_remapped_eid": 129,
-    "expand_zero_step_err": 0.0,
+    "expand_zero_step_err": 2.4e-07,
     "asymmetric_split_grid_ks": [
       64,
       128
@@ -105,29 +105,64 @@
     },
     "wormhole_mitosis_switches": 1
   },
+  "exp7_dirty_data_auto_split_and_low_wake": {
+    "order_invariance_counts_truth_first": [
+      5,
+      1
+    ],
+    "order_invariance_counts_fake_first": [
+      5,
+      1
+    ],
+    "order_invariance_truth_cosine_diff": 0.0,
+    "split_clean_pmc_id": "MixedCorpus_SubA_s1.pmc (grid_k=128)",
+    "split_dirty_pmc_id": "MixedCorpus_SubB_s1.pmc (grid_k=64)",
+    "clean_query_clean_pmc_slot_hits": 63,
+    "clean_query_dirty_pmc_slot_hits": 0,
+    "dirty_pmc_wake_rate_pct": 0.0
+  },
+  "exp8_five_dimensional_complexity_scaling": {
+    "dim1_vocab_size_and_transducer_params": [
+      0,
+      0
+    ],
+    "dim2_seq_len_8x_state_mem_ratio": 1.0,
+    "dim2_seq_len_8x_time_ratio": 7.69,
+    "dim3_experts_16x_scale_4096_to_65536": 16.0,
+    "dim3_cold_subkey_ops_scale_sqrt_m": 4.0,
+    "dim3_hot_streamline_pointer_hops": 1,
+    "dim4_reasoning_hops_before_and_after_wormhole": [
+      6,
+      1
+    ],
+    "dim4_preserved_base_track_hop": 20,
+    "dim5_16384_experts_touched_pages": 2,
+    "dim5_untouched_experts_pct": 99.9878,
+    "dim5_optimizer_memory_bytes": 0
+  },
   "end_to_end_training_15steps": {
     "architecture": "Penrose-v1.0 (MPU-2048 + PMC + Harness)",
     "d_model": 512,
     "vocab_size": 0,
     "pmc_optimizer_memory_bytes": 0,
     "steps": 15,
-    "elapsed_sec": 14.978,
+    "elapsed_sec": 21.115,
     "history": [
       {
         "step": 1,
         "num_wavepackets": 34,
-        "loss": 0.162976,
-        "active_pages": 35,
-        "mitosis_spawns": 5,
+        "loss": 0.395604,
+        "active_pages": 34,
+        "mitosis_spawns": 6,
         "closure_count": 0,
         "forest_events": []
       },
       {
         "step": 5,
         "num_wavepackets": 35,
-        "loss": 0.275979,
-        "active_pages": 4265,
-        "mitosis_spawns": 26,
+        "loss": 0.159492,
+        "active_pages": 4272,
+        "mitosis_spawns": 25,
         "closure_count": 64,
         "forest_events": [
           {
@@ -135,7 +170,7 @@
             "op": "Auto-Spawn",
             "new_pkg": "Spec_general_1_s5.pmc",
             "domain": "general",
-            "low_hit_ratio": 0.9412,
+            "low_hit_ratio": 0.8966,
             "grid_k": 64
           },
           {
@@ -149,23 +184,24 @@
       {
         "step": 10,
         "num_wavepackets": 37,
-        "loss": 0.254691,
-        "active_pages": 8485,
-        "mitosis_spawns": 55,
+        "loss": 0.326638,
+        "active_pages": 4334,
+        "mitosis_spawns": 56,
         "closure_count": 128,
         "forest_events": [
           {
             "step": 10,
-            "op": "Auto-Spawn",
-            "new_pkg": "Spec_general_2_s10.pmc",
-            "domain": "general",
-            "low_hit_ratio": 0.6471,
-            "grid_k": 64
+            "op": "Auto-Merge",
+            "pkg_a": "Base_v1.pmc",
+            "pkg_b": "Spec_general_1_s5.pmc",
+            "merged_pkg": "TriadicMerge_1_s10.pmc",
+            "coactivation_ratio": 0.6818,
+            "new_grid_k": 128
           },
           {
             "step": 10,
             "op": "Auto-Closure",
-            "pkg_id": "Base_v1.pmc",
+            "pkg_id": "TriadicMerge_1_s10.pmc",
             "crystallized_count": 64
           }
         ]
@@ -173,62 +209,34 @@
       {
         "step": 15,
         "num_wavepackets": 20,
-        "loss": 0.240619,
-        "active_pages": 12682,
-        "mitosis_spawns": 78,
-        "closure_count": 192,
+        "loss": 0.136772,
+        "active_pages": 3740,
+        "mitosis_spawns": 76,
+        "closure_count": 256,
         "forest_events": [
           {
             "step": 15,
-            "op": "Auto-Spawn",
-            "new_pkg": "Spec_general_3_s15.pmc",
-            "domain": "general",
-            "low_hit_ratio": 0.8182,
-            "grid_k": 64
+            "op": "Auto-Split",
+            "parent_pkg": "TriadicMerge_1_s10.pmc",
+            "child_a": "TriadicMerge_1_s10_SubA_s15.pmc",
+            "child_b": "TriadicMerge_1_s10_SubB_s15.pmc",
+            "bridge_pkg": "TriadicMerge_1_s10_BridgeAB_s15.pmc",
+            "grid_k": "128 -> (64, 64)"
           },
           {
             "step": 15,
             "op": "Auto-Closure",
-            "pkg_id": "Base_v1.pmc",
+            "pkg_id": "TriadicMerge_1_s10_SubA_s15.pmc",
+            "crystallized_count": 64
+          },
+          {
+            "step": 15,
+            "op": "Auto-Closure",
+            "pkg_id": "TriadicMerge_1_s10_SubB_s15.pmc",
             "crystallized_count": 64
           }
         ]
       }
     ]
-  },
-  "exp7_dirty_data_auto_split_and_low_wake": {
-    "order_invariance_counts_truth_first": [
-      5,
-      1
-    ],
-    "order_invariance_counts_fake_first": [
-      5,
-      1
-    ],
-    "order_invariance_truth_cosine_diff": 0.0,
-    "split_clean_pmc_id": "MixedCorpus_SubA_s1.pmc (grid_k=128)",
-    "split_dirty_pmc_id": "MixedCorpus_SubB_s1.pmc (grid_k=64)",
-    "clean_query_clean_pmc_slot_hits": 38,
-    "clean_query_dirty_pmc_slot_hits": 0,
-    "dirty_pmc_wake_rate_pct": 0.0
-  },
-  "exp8_five_dimensional_complexity_scaling": {
-    "dim1_vocab_size_and_transducer_params": [
-      0,
-      0
-    ],
-    "dim2_seq_len_8x_state_mem_ratio": 1.0,
-    "dim2_seq_len_8x_time_ratio": 8.52,
-    "dim3_experts_16x_scale_4096_to_65536": 16.0,
-    "dim3_cold_subkey_ops_scale_sqrt_m": 4.0,
-    "dim3_hot_streamline_pointer_hops": 1,
-    "dim4_reasoning_hops_before_and_after_wormhole": [
-      6,
-      1
-    ],
-    "dim4_preserved_base_track_hop": 20,
-    "dim5_16384_experts_touched_pages": 2,
-    "dim5_untouched_experts_pct": 99.9878,
-    "dim5_optimizer_memory_bytes": 0
   }
 }

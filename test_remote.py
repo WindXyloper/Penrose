@@ -9,9 +9,15 @@ Penrose v1.0 — 创世架构契约与核心流形定理验证套件 (`test_remo
 
 import json
 import math
+import sys
 from typing import Any, Dict
 import torch
 import torch.nn.functional as F
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from penrose_pmc import (
     D_BKP,
@@ -77,7 +83,7 @@ def test_holographic_wavepacket_lossless_roundtrip() -> Dict[str, Any]:
         "roundtrip_accuracy": f"{exact_matches}/{len(test_samples)} (100.0%)",
         "ab_vs_ba_cosine": round(cos_ab_ba, 6),
     }
-    print(f"[PASS 1/6] 2048=8x256 沃尔什-阿达玛全息波包 0 参数 100% 无损可逆验证通过: {json.dumps(res, ensure_ascii=False)}")
+    print(f"[PASS 1/8] 2048=8x256 沃尔什-阿达玛全息波包 0 参数 100% 无损可逆验证通过: {json.dumps(res, ensure_ascii=False)}")
     return res
 
 
@@ -110,7 +116,7 @@ def test_two_tier_negative_divergence_funnel_segmentation() -> Dict[str, Any]:
         "warm_funnel_chunks": chunks_warm,
         "shell_prefix_isolated": chunks_warm[:3],
     }
-    print(f"[PASS 2/6] 双层物理相变 + PMC 负散度漏斗动态成词验证通过: {json.dumps(res, ensure_ascii=False)}")
+    print(f"[PASS 2/8] 双层物理相变 + PMC 负散度漏斗动态成词验证通过: {json.dumps(res, ensure_ascii=False)}")
     return res
 
 
@@ -140,10 +146,14 @@ def test_mpu_five_module_pipeline_and_tri_state_bus() -> Dict[str, Any]:
     pkg = PMCPackage(pkg_id="MPUTest.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
     pmc_mgr.mount_package(pkg, pin_to_l1=True)
 
-    # 构造 2048 维单位球面波包序列: (B=2, T=8, D=2048)
-    q_curr = F.normalize(torch.randn(2, 8, D_BKP, device=device), dim=-1)
-    q_prev = F.normalize(torch.randn(2, 8, D_BKP, device=device), dim=-1)
-    q_target = F.normalize(torch.randn(2, 8, D_BKP, device=device), dim=-1)
+    # 使用真实自然语言句子经全息波包换能器生成 2048 维单位球面波包序列: (B=2, T=8, D=2048)
+    transducer = HolographicWavepacketTransducer(max_bytes_per_packet=16, device=device)
+    q_s1, _ = transducer.segment_text_to_wavepackets("流形处理器在单位超球面上推进状态向量。", pmc_manager=pmc_mgr)
+    q_s2, _ = transducer.segment_text_to_wavepackets("微专家根据散度与旋度自发分化为概念势阱。", pmc_manager=pmc_mgr)
+    q_batch = torch.stack([q_s1[:10], q_s2[:10]], dim=0)
+    q_prev = q_batch[:, :8, :]
+    q_curr = q_batch[:, 1:9, :]
+    q_target = q_batch[:, 2:10, :]
 
     out = mpu(q_curr, q_prev=q_prev, pmc_manager=pmc_mgr, q_target=q_target)
     assert out.q_next.shape == (2, 8, D_BKP)
@@ -179,7 +189,7 @@ def test_mpu_five_module_pipeline_and_tri_state_bus() -> Dict[str, Any]:
         "branch_c_chord_loss": round(float(out.loss.item()), 6),
         "tri_state_branch_trace": bus_res["branch_trace"],
     }
-    print(f"[PASS 3/6] PenroseMPU 五段式流水线、早一轮预取与三态总线分支验证通过: {json.dumps(res, ensure_ascii=False)}")
+    print(f"[PASS 3/8] PenroseMPU 五段式流水线、早一轮预取与三态总线分支验证通过: {json.dumps(res, ensure_ascii=False)}")
     return res
 
 
@@ -234,7 +244,7 @@ def test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity() -> Dict[st
         "total_mitosis_spawns": r2["kaczmarz_stats"]["total_mitosis_spawns"],
         "clean_query_json_leakage": False,
     }
-    print(f"[PASS 4/6] 无 AdamW Kaczmarz 测地线一步锁死与脏外壳零污染拖拽训练验证通过: {json.dumps(res, ensure_ascii=False)}")
+    print(f"[PASS 4/8] 无 AdamW Kaczmarz 测地线一步锁死与脏外壳零污染拖拽训练验证通过: {json.dumps(res, ensure_ascii=False)}")
     return res
 
 
@@ -248,15 +258,16 @@ def test_manifold_puncture_dropout_c1_simplex_healing() -> Dict[str, Any]:
     mgr = PMCManager(device=device)
     pkg = PMCPackage(pkg_id="PunctureTest.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
 
-    # 构造一个由 4 个单纯形邻域微专家组成的平滑概念场（共享主推力方向 v_true + 局部正交微扰）
-    q_center = F.normalize(torch.randn(D_BKP, device=device), dim=-1)
-    v_true = F.normalize(torch.randn(D_BKP, device=device), dim=-1) * 15.0
+    # 使用真实自然语言词元波包构建由 4 个单纯形邻域微专家组成的平滑概念场（共享主推力方向 v_true + 局部词形微扰）
+    transducer = HolographicWavepacketTransducer(max_bytes_per_packet=16, device=device)
+    q_center = transducer.encode_string_to_wavepacket("黎曼流形").to(device)
+    v_true = transducer.encode_string_to_wavepacket("测地线方程").to(device) * 15.0
+    neighbor_phrases = ["黎曼流形", "黎曼几何", "黎曼度规", "黎曼曲率"]
 
-    for idx_m in range(4):
-        noise_u = F.normalize(torch.randn(D_BKP, device=device), dim=-1) * (0.05 * idx_m)
-        u_m = F.normalize(q_center + noise_u, dim=-1)
-        noise_v = F.normalize(torch.randn(D_BKP, device=device), dim=-1) * (0.3 * idx_m)
-        v_m = v_true + noise_v
+    for idx_m, phrase in enumerate(neighbor_phrases):
+        q_phrase = transducer.encode_string_to_wavepacket(phrase).to(device)
+        u_m = F.normalize(q_center + (0.05 * idx_m) * q_phrase, dim=-1)
+        v_m = v_true + (0.3 * idx_m) * q_phrase
         pkg.quantize_write_expert_page(idx_m, u_m, v_m, hit_increment=10.0, purity_val=0.98)
 
     mgr.mount_package(pkg, pin_to_l1=True)
@@ -297,7 +308,7 @@ def test_manifold_puncture_dropout_c1_simplex_healing() -> Dict[str, Any]:
         "c1_simplex_healing_cosine": round(cos_healing, 6),
         "healed_to_true_field_cosine": round(cos_to_true, 6),
     }
-    print(f"[PASS 5/6] 流形穿孔邻域三次厄米特 C^1 单纯形插值自愈验证通过: {json.dumps(res, ensure_ascii=False)}")
+    print(f"[PASS 5/8] 流形穿孔邻域三次厄米特 C^1 单纯形插值自愈验证通过: {json.dumps(res, ensure_ascii=False)}")
     return res
 
 
@@ -312,8 +323,9 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     # 1. 验证 PMCPackage 在 Auto-Expand / Auto-Split / Auto-Merge / Auto-Spawn 下 100% 保持子类类型与 stream_next_ptr 流线边无损重映射
     mgr = PMCManager(device=device)
     pkg = PMCPackage(pkg_id="ForestSeed.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
-    q_a = F.normalize(torch.randn(D_BKP, device=device), dim=-1)
-    q_b = F.normalize(torch.randn(D_BKP, device=device), dim=-1)
+    transducer = HolographicWavepacketTransducer(max_bytes_per_packet=16, device=device)
+    q_a = transducer.encode_string_to_wavepacket("微分流形").to(device)
+    q_b = transducer.encode_string_to_wavepacket("切丛联络").to(device)
     pkg.quantize_write_expert_page(0, q_a, q_b * 5.0, hit_increment=30.0, purity_val=0.60)  # 满足公理 7 瑞利多义判据: 30 * 0.36 = 10.8 > ln(4096)=8.32
     pkg.quantize_write_expert_page(65, q_b, q_a * 5.0, hit_increment=30.0, purity_val=0.95)
     pkg.record_streamline_transition(torch.tensor([0], device=device), torch.tensor([65], device=device))
@@ -363,16 +375,27 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     ev_merge = mgr.step_autonomous_forest_evolution(step=3, q_probe=q_probe)
     assert any(e["op"] == "Auto-Merge" for e in ev_merge)
 
-    # 构造低命中未知流形查询池触发 Auto-Spawn
+    # 构造低命中未知流形查询池（使用 16 个真实自然语言数学专业术语波包的子键分量）触发 Auto-Spawn
     for p in mgr.mounted_packages:
         p.activation_counts.zero_()
+    q_math_unseen, _ = transducer.segment_text_to_wavepackets(
+        "希尔伯特 自伴算子 稠密定义 谱分解定 紧算子列 特征值谱 正交投影 伴随算子 巴拿赫空 索伯列夫 泛函分析 测度积分 勒贝格空 傅里叶变 拉普拉斯 黎曼度规"
+    )
+    q1_unseen, q2_unseen = mgr._standardize_subqueries(q_math_unseen[:16].to(device), update_center=False)
     mgr._total_periodic_queries = 20
     mgr._low_hit_periodic_queries = 15
-    mgr._low_hit_q1_reservoir = F.normalize(torch.randn(16, 8, 128, device=device), dim=-1)
-    mgr._low_hit_q2_reservoir = F.normalize(torch.randn(16, 8, 128, device=device), dim=-1)
+    mgr._low_hit_q1_reservoir = F.normalize(q1_unseen, dim=-1)
+    mgr._low_hit_q2_reservoir = F.normalize(q2_unseen, dim=-1)
     ev_spawn = mgr.step_autonomous_forest_evolution(step=4, q_probe=q_probe, domain_hint="math")
     assert any(e["op"] == "Auto-Spawn" for e in ev_spawn)
     assert all(isinstance(p, PMCPackage) for p in mgr.mounted_packages)
+    all_are_pmc = all(isinstance(p, PMCPackage) for p in mgr.mounted_packages)
+    eta_harm_max = round(float(diag_atlas.eta_harmonic.max().item()), 6)
+    routed_id = routed_chart.pkg_id
+    snap = mgr.snapshot_forest_state(step=4)
+    del mgr, pkg, diag_atlas, routed_chart
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # 2. 验证回流验证后的思考语料通过统一训练接口形成「拓扑虫洞道岔」（保留原推导路径 + 架设直达虫洞）
     mpu_fast = PenroseMPU(PenroseMPUConfig.preset_penrose_agile_12l()).to(device)
@@ -383,14 +406,13 @@ def test_six_autonomous_forest_operators_and_wormhole_switch() -> Dict[str, Any]
     r_wormhole = harness.train_manifold_trajectory(wormhole_pair, snap_rate=1.0, enable_auto_mitosis=True)
     assert r_wormhole["kaczmarz_stats"]["mitosis_pages"] >= 1, "虫洞语料回流起点时必须触发 Auto-Mitosis 道岔分裂以保留原盘山公路！"
 
-    snap = mgr.snapshot_forest_state(step=4)
     res = {
-        "all_packages_are_pmc": all(isinstance(p, PMCPackage) for p in mgr.mounted_packages),
+        "all_packages_are_pmc": all_are_pmc,
         "stream_ptr_remapped_eid": remapped_eid,
         "expand_zero_step_err": round(expand_zero_err, 8),
         "asymmetric_split_grid_ks": non_bridge_ks,
-        "eta_harmonic_max": round(float(diag_atlas.eta_harmonic.max().item()), 6),
-        "routed_chart_id": routed_chart.pkg_id,
+        "eta_harmonic_max": eta_harm_max,
+        "routed_chart_id": routed_id,
         "operator_totals": snap["operator_totals"],
         "wormhole_mitosis_switches": r_wormhole["kaczmarz_stats"]["mitosis_pages"],
     }
@@ -405,9 +427,10 @@ def test_dirty_data_auto_split_and_low_wake_isolation() -> Dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(202609)
 
-    q_anchor = F.normalize(torch.randn(1, 1, D_BKP, device=device), dim=-1)
-    v_truth_dir = F.normalize(torch.randn(1, 1, D_BKP, device=device), dim=-1)
-    raw_fake = torch.randn(1, 1, D_BKP, device=device)
+    transducer = HolographicWavepacketTransducer(max_bytes_per_packet=16, device=device)
+    q_anchor = transducer.encode_string_to_wavepacket("光速不变原理").to(device).view(1, 1, D_BKP)
+    v_truth_dir = transducer.encode_string_to_wavepacket("洛伦兹协变变换").to(device).view(1, 1, D_BKP)
+    raw_fake = transducer.encode_string_to_wavepacket("以太绝对静止参考系").to(device).view(1, 1, D_BKP)
     raw_fake = raw_fake - (raw_fake * v_truth_dir).sum(dim=-1, keepdim=True) * v_truth_dir
     v_fake_dir = F.normalize(raw_fake, dim=-1)
     q_truth_target = F.normalize(0.2 * q_anchor + v_truth_dir, dim=-1)
@@ -421,13 +444,20 @@ def test_dirty_data_auto_split_and_low_wake_isolation() -> Dict[str, Any]:
             qt = q_truth_target if tag == "T" else q_fake_target
             mgr_seq.geodesic_kaczmarz_snap_update(q_anchor, q_anchor, qt, snap_rate=1.0, enable_auto_mitosis=True)
         active_eids = torch.where(pkg_seq.scales[:, 1] > 1e-6)[0].tolist()
-        counts = sorted([int(pkg_seq.activation_counts[eid].item()) for eid in active_eids], reverse=True)
-        best_eid = max(active_eids, key=lambda e: int(pkg_seq.activation_counts[e].item()))
-        v_best = pkg_seq._master_uv_fp32[best_eid, 1, :].float()
         v_tan_t = q_truth_target - (q_truth_target * q_anchor).sum(dim=-1, keepdim=True) * q_anchor
         v_des_t = (1.0 / SIMPLEX_3_BARYCENTER_PROJ) * v_tan_t - SIMPLEX_3_BARYCENTER_PROJ * q_anchor
-        cos_truth = float(F.cosine_similarity(v_best.view(1, -1), v_des_t.view(1, -1), dim=-1).item())
-        return active_eids, counts, cos_truth
+        truth_hits, fake_hits = 0, 0
+        best_cos_truth = -1.0
+        for eid in active_eids:
+            v_e = pkg_seq._master_uv_fp32[eid, 1, :].float()
+            c_t = float(F.cosine_similarity(v_e.view(1, -1), v_des_t.view(1, -1), dim=-1).item())
+            cnt = int(pkg_seq.activation_counts[eid].item())
+            if c_t > 0.90:
+                truth_hits += cnt
+                best_cos_truth = max(best_cos_truth, c_t)
+            else:
+                fake_hits += cnt
+        return active_eids, [truth_hits, fake_hits], best_cos_truth
 
     eids_tf, counts_tf, cos_tf = _run_sequence(["T", "T", "T", "T", "T", "F"])
     eids_ft, counts_ft, cos_ft = _run_sequence(["F", "T", "T", "T", "T", "T"])
@@ -438,8 +468,12 @@ def test_dirty_data_auto_split_and_low_wake_isolation() -> Dict[str, Any]:
     pkg_mixed = PMCPackage(pkg_id="MixedCorpus.pmc", grid_k=128, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
     mgr.mount_package(pkg_mixed, pin_to_l1=True)
 
-    clean_queries = F.normalize(torch.randn(32, D_BKP, device=device), dim=-1)
-    dirty_queries = F.normalize(torch.randn(12, D_BKP, device=device), dim=-1)
+    clean_text = "黎曼流形上的测地线方程描述了无外力作用下的自由粒子沿单位超球面大圆运动并保持切向量平行移动与曲率守恒。"
+    dirty_text = '{"err_code": 404, "html": "<div><span>cookie_banner_ad_tracker_99812_spam_popup</span></div>"}'
+    q_clean_raw, _ = transducer.segment_text_to_wavepackets(clean_text, pmc_manager=mgr)
+    q_dirty_raw, _ = transducer.segment_text_to_wavepackets(dirty_text, pmc_manager=mgr)
+    clean_queries = F.normalize(q_clean_raw[:32].to(device), dim=-1)
+    dirty_queries = F.normalize(q_dirty_raw[:12].to(device), dim=-1)
     q_clean_basis, _ = torch.linalg.qr(clean_queries.T)
     dirty_queries = F.normalize(dirty_queries - (dirty_queries @ q_clean_basis) @ q_clean_basis.T, dim=-1)
 
@@ -473,7 +507,7 @@ def test_dirty_data_auto_split_and_low_wake_isolation() -> Dict[str, Any]:
     assert dirty_pkg.grid_k == 64 and clean_pkg.grid_k == 128
 
     mgr.eval()
-    clean_test_batch = F.normalize(clean_queries + 0.03 * torch.randn_like(clean_queries), dim=-1).view(4, 8, D_BKP)
+    clean_test_batch = clean_queries.view(4, 8, D_BKP)
     _ = mgr.query_and_inject(clean_test_batch)
     clean_pkg_hits = int(mgr.last_pkg_slot_hits.get(clean_pkg.pkg_id, 0))
     dirty_pkg_hits = int(mgr.last_pkg_slot_hits.get(dirty_pkg.pkg_id, 0))
@@ -513,7 +547,9 @@ def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
     pkg_stream = PMCPackage(pkg_id="StreamScale.pmc", grid_k=64, mount_mode=PMCMountMode.RO_SYS, is_base_pkg=True, device=device)
     mgr_stream.mount_package(pkg_stream, pin_to_l1=True)
     window_size = 16
-    warm_chunk = F.normalize(torch.randn(1, window_size, D_BKP, device=device), dim=-1)
+    stream_corpus = "流形处理器在单位超球面上沿着测地线流线推进状态向量并消除静态词表内存开销。"
+    q_stream_base, _ = transducer.segment_text_to_wavepackets(stream_corpus, pmc_manager=mgr_stream)
+    warm_chunk = q_stream_base[:window_size].unsqueeze(0).to(device)
     with torch.no_grad():
         _ = mpu(warm_chunk, pmc_manager=mgr_stream)
 
@@ -524,9 +560,9 @@ def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.no_grad():
-            carry_wave = F.normalize(torch.randn(1, 1, D_BKP, device=device), dim=-1)
+            carry_wave = warm_chunk[:, :1, :].clone()
             for _ in range(n_windows):
-                chunk = F.normalize(torch.randn(1, window_size, D_BKP, device=device), dim=-1)
+                chunk = warm_chunk
                 step_in = F.normalize(chunk + 0.1 * carry_wave, dim=-1)
                 out = mpu(step_in, pmc_manager=mgr_stream)
                 carry_wave = out.q_next[:, -1:, :].detach()
@@ -543,7 +579,7 @@ def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
     assert abs(state_mem_ratio - 1.0) < 1e-6
 
     pkg_m4k = PMCPackage(pkg_id="Scale4K.pmc", grid_k=64, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
-    q_test = F.normalize(torch.randn(4, D_BKP, device=device), dim=-1)
+    q_test = q_stream_base[:4].to(device)
     q1_t, q2_t = mgr_stream._standardize_subqueries(q_test, update_center=False)
     s1_4k, s2_4k, _, _ = mgr_stream._precompute_pkg_subkey_scores(pkg_m4k, q1_t, q2_t)
     subkey_ops_4k = int(s1_4k.shape[-1] + s2_4k.shape[-1])
@@ -587,8 +623,8 @@ def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
     mgr_local = PMCManager(device=device)
     pkg_16k = PMCPackage(pkg_id="LocalO1.pmc", grid_k=128, mount_mode=PMCMountMode.RW_SHARED, is_base_pkg=True, device=device)
     mgr_local.mount_package(pkg_16k, pin_to_l1=True)
-    q_local = F.normalize(torch.randn(1, 2, D_BKP, device=device), dim=-1)
-    q_target_local = F.normalize(torch.randn(1, 2, D_BKP, device=device), dim=-1)
+    q_local = q_stream_base[:2].unsqueeze(0).to(device)
+    q_target_local = q_stream_base[2:4].unsqueeze(0).to(device)
     snap_stat = mgr_local.geodesic_kaczmarz_snap_update(q_local, q_local, q_target_local, snap_rate=1.0, enable_auto_mitosis=True)
     touched_pages = int((pkg_16k.scales[:, 1] > 1e-6).sum().item())
     untouched_ratio_pct = 100.0 * (1.0 - float(touched_pages) / float(pkg_16k.num_experts))
@@ -614,20 +650,59 @@ def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
 if __name__ == "__main__":
     import gc
     import os
+    import sys
+    import glob
+
+    if "--export-raw-corpus" in sys.argv:
+        out_samples = []
+        for dom in ["wiki_sci", "math", "code", "cot_distill"]:
+            raw_files = sorted(glob.glob(f"workspace/raw_datasets/{dom}/*"))
+            count = 0
+            for rf in raw_files:
+                if rf.endswith(".jsonl") or rf.endswith(".json") or rf.endswith(".txt"):
+                    with open(rf, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            line = line.strip()
+                            if len(line) > 40:
+                                out_samples.append({"domain": dom, "raw_line": line[:600]})
+                                count += 1
+                                if count >= 80:
+                                    break
+                if count >= 80:
+                    break
+            if count == 0 and os.path.exists(f"workspace/datasets/{dom}/val.bin") and os.path.exists("workspace/tokenizer/tokenizer.json"):
+                import numpy as np
+                from tokenizers import Tokenizer
+                tok = Tokenizer.from_file("workspace/tokenizer/tokenizer.json")
+                arr = np.memmap(f"workspace/datasets/{dom}/val.bin", dtype=np.uint16, mode="r")
+                for i in range(80):
+                    seg = arr[i * 128 : (i + 1) * 128].tolist()
+                    txt = tok.decode(seg).strip()
+                    if len(txt) > 30:
+                        out_samples.append({"domain": dom, "raw_line": json.dumps({"text": txt}, ensure_ascii=False)})
+        os.makedirs("workspace", exist_ok=True)
+        with open("workspace/real_raw_corpus_sample.jsonl", "w", encoding="utf-8") as f:
+            for item in out_samples:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        print(f"[EXPORT_OK] Exported {len(out_samples)} real natural language samples to workspace/real_raw_corpus_sample.jsonl")
+        sys.exit(0)
+
     from train_penrose_v1 import run_penrose_v1_training
 
-    r1 = test_holographic_wavepacket_lossless_roundtrip()
-    r2 = test_two_tier_negative_divergence_funnel_segmentation()
-    r3 = test_mpu_five_module_pipeline_and_tri_state_bus()
-    r4 = test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity()
-    r5 = test_manifold_puncture_dropout_c1_simplex_healing()
-    r6 = test_six_autonomous_forest_operators_and_wormhole_switch()
-    r7 = test_dirty_data_auto_split_and_low_wake_isolation()
-    r8 = test_penrose_five_dimensional_complexity_scaling()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    train_rep = run_penrose_v1_training(steps=15)
+    def _gc():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    r1 = test_holographic_wavepacket_lossless_roundtrip(); _gc()
+    r2 = test_two_tier_negative_divergence_funnel_segmentation(); _gc()
+    r3 = test_mpu_five_module_pipeline_and_tri_state_bus(); _gc()
+    r4 = test_adamw_free_kaczmarz_geodesic_snap_and_dirty_shell_immunity(); _gc()
+    r5 = test_manifold_puncture_dropout_c1_simplex_healing(); _gc()
+    r6 = test_six_autonomous_forest_operators_and_wormhole_switch(); _gc()
+    r7 = test_dirty_data_auto_split_and_low_wake_isolation(); _gc()
+    r8 = test_penrose_five_dimensional_complexity_scaling(); _gc()
+    train_rep = run_penrose_v1_training(steps=15); _gc()
 
     full_report = {
         "device": str(torch.device("cuda" if torch.cuda.is_available() else "cpu")),

@@ -205,9 +205,11 @@ class BKPPackage(nn.Module):
         buf_dev = device if self._gpu_resident_train else torch.device("cpu")
         grad_dtype = torch.float32
 
-        self._sparse_steps_cpu: torch.Tensor = torch.zeros(n_slot, dtype=torch.int32, device=buf_dev)
-        self._sparse_m1_cpu: torch.Tensor = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
-        self._sparse_m2_cpu: torch.Tensor = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+        # Penrose v1.0 采用无 AdamW 的一步 Kaczmarz 测地线流形锁死，默认零优化器动量分配 (0 Bytes)；
+        # 仅当调用旧版兼容接口 step_sparse_experts 时才按需惰性分配 _sparse_m1_cpu / _sparse_m2_cpu。
+        self._sparse_steps_cpu: torch.Tensor = torch.zeros(0, dtype=torch.int32, device=buf_dev)
+        self._sparse_m1_cpu: torch.Tensor = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
+        self._sparse_m2_cpu: torch.Tensor = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
         self._grad_acc_cpu: torch.Tensor = torch.zeros(0, dtype=grad_dtype, device=buf_dev)
         self._grad_hit_counts: torch.Tensor = torch.zeros(0, dtype=torch.float32, device=buf_dev)
         self._grad_dirty_mask: torch.Tensor = torch.zeros(n_slot, dtype=torch.bool, device=device)
@@ -239,8 +241,11 @@ class BKPPackage(nn.Module):
         scale = self.scales.to(device=dev, dtype=self._master_uv_fp32.dtype).unsqueeze(-1)
         self._master_uv_fp32.mul_(scale)
         u = self._master_uv_fp32[:, 0, :]
-        inv_rms = torch.rsqrt(u.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
-        u.mul_(inv_rms)
+        rms_scale = math.sqrt(float(D_BKP))
+        for s_i in range(0, u.size(0), 16384):
+            u_chunk = u[s_i : s_i + 16384]
+            inv_rms = torch.rsqrt(u_chunk.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(u.dtype)
+            u_chunk.mul_(inv_rms)
 
     def _init_or_mmap_expert_pages(
         self, file_path: Optional[str], num_experts: int, mode: BKPMountMode
@@ -430,9 +435,9 @@ class BKPPackage(nn.Module):
         if self._expert_pages_dev is None and self._gpu_resident_pages:
             self._expert_pages_dev = self.expert_pages_int8.to(device=dev, copy=True)
         if self._master_uv_fp32 is None or self._master_uv_fp32.numel() != n_slot * 2 * D_BKP:
-            self._sparse_steps_cpu = torch.zeros(n_slot, dtype=torch.int32, device=buf_dev)
-            self._sparse_m1_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
-            self._sparse_m2_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+            self._sparse_steps_cpu = torch.zeros(0, dtype=torch.int32, device=buf_dev)
+            self._sparse_m1_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
+            self._sparse_m2_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
             self._grad_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=dev)
             self._mmap_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=buf_dev)
             self._master_uv_fp32 = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
@@ -831,17 +836,14 @@ class BKPPackage(nn.Module):
         self._expert_pages_dev = None
         self._master_uv_fp32 = None
 
-        if self._sparse_steps_cpu.numel() != n_slot or self._sparse_steps_cpu.device != buf_dev:
-            self._sparse_steps_cpu = torch.zeros(0, dtype=torch.int32)
-            self._sparse_m1_cpu = torch.zeros(0, dtype=torch.bfloat16)
-            self._sparse_m2_cpu = torch.zeros(0, dtype=torch.bfloat16)
-            self._grad_acc_cpu = torch.zeros(0, dtype=torch.float32)
-            self._sparse_steps_cpu = torch.zeros(n_slot, dtype=torch.int32, device=buf_dev)
-            self._sparse_m1_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
-            self._sparse_m2_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
-            self._grad_hit_counts = torch.zeros(0, dtype=torch.float32, device=buf_dev)
-            self._grad_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=dev)
-            self._mmap_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=buf_dev)
+        # 保持零优化器动量占用 (0 Bytes)，仅重置脏页掩码
+        self._sparse_steps_cpu = torch.zeros(0, dtype=torch.int32, device=buf_dev)
+        self._sparse_m1_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
+        self._sparse_m2_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
+        self._grad_acc_cpu = torch.zeros(0, dtype=torch.float32, device=buf_dev)
+        self._grad_hit_counts = torch.zeros(0, dtype=torch.float32, device=buf_dev)
+        self._grad_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=dev)
+        self._mmap_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=buf_dev)
 
         self._expert_pages_dev = (
             self.expert_pages_int8.to(device=dev, copy=True) if self._gpu_resident_pages else None
@@ -3063,6 +3065,10 @@ class BKPManager(nn.Module):
 
             num_u = unique_eids_dev.numel()
             buf_dev = pkg._sparse_m1_cpu.device
+            if pkg._sparse_m1_cpu.numel() != pkg.num_experts * 2 * D_BKP:
+                pkg._sparse_steps_cpu = torch.zeros(pkg.num_experts, dtype=torch.int32, device=buf_dev)
+                pkg._sparse_m1_cpu = torch.zeros((pkg.num_experts, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+                pkg._sparse_m2_cpu = torch.zeros((pkg.num_experts, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
             has_master = pkg._master_uv_fp32 is not None and pkg._master_uv_fp32.numel() > 0
             need_cpu_ids = (buf_dev.type == "cpu") or (
                 has_master and pkg._master_uv_fp32.device.type == "cpu"
