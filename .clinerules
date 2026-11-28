@@ -1,0 +1,68 @@
+# ROLE & ENVIRONMENT
+You are a master AI coding agent running on a LOCAL Windows machine (`F:\Penrose`), developing and running experiments for a REMOTE Linux A100 server (`ai-pilot.Penrose` -> `/home/coder/Penrose`, conda env `penrose`).
+
+# HARD RULES (NON-NEGOTIABLE)
+1. **Never** open an interactive shell or a long-lived foreground process. Every command must be single-shot and self-contained.
+2. **Never poll, never loop, never `Start-Sleep`-and-recheck.** One `launch` is enough; a hidden background watcher daemon already blocks on the remote kernel signal and pulls everything back when the run finishes (see ANTI-POLLING PROTOCOL).
+3. **Never** pass long multi-line strings, `python -c "..."` with nested quotes, or complex escapes to `remote_bridge.py exec` (PowerShell mangles them). Put any remote diagnostic into `F:\Penrose\test_remote.py` (see TEST_SCRIPT STANDARD).
+4. **Always** read/edit files locally in `F:\Penrose`, then `python remote_bridge.py push` to sync (CRLF->LF + MD5 verified). Never hand-edit files on the remote host.
+5. Never re-run `launch` for an experiment that is already running.
+6. **Zero Hallucination / Verify Before Speaking**: Whenever in doubt about code logic, tensor shapes, historical designs, or runtime metrics, **never** guess or rely on stale conversation summaries. Always inspect the actual source files (`read_files` / `search_codebase`) or logs first, and base every statement strictly on verified ground truth.
+7. **Versioned Git Commit, Experiment Archive (`workspace/experiment_log/`) & GitHub Push Protocol**:
+   - Whenever a probe experiment (`test_remote.py`) or training run (`vXX`) finishes, archive the standalone probe script snapshot and complete output report into `F:\Penrose\workspace\experiment_log\<exp_name>/` so every experiment is permanently reproducible in Git, and remove one-off probe functions from root scripts to keep the root codebase lean.
+   - Check whether new mathematical insights, empirical laws, or engineering pitfalls were uncovered and append them to `F:\Penrose\学术发现.md` (keeping `README.md` as the clean project whitepaper).
+   - Stage all tracked source/config/doc/archive changes, create a structured `git commit -m "vXX: <concise summary of architecture changes and verified metrics>"`, and push to `https://github.com/WindXyloper/Penrose.git` (`git push -u origin master` / `main`).
+8. **Zero Unnecessary Edits to CLI Default Values (`argparse`)**: **Never** edit `default=...` in `argparse.ArgumentParser` (such as `--run-name`, `--total-steps`, or run-specific hyperparameter overrides) just to label or configure a new run. Always pass run names and overrides via `launch` CLI arguments or `-e KEY=VAL` environment variables to save tokens and avoid meaningless git diffs.
+9. **Core Source Code & A100 Performance Protection (Zero Unauthorized Source Edits / Zero Local Downgrade)**:
+   - **Never** modify core framework files (`bkp_manager.py`, `penrose_pmc.py`, `penrose_mpu.py`, `penrose_harness.py`) to lower GPU residency thresholds (`_gpu_resident_pages`, `_gpu_resident_train`), disable master FP32 caches (`_master_uv_fp32`), downgrade default model presets, or move CUDA tensor ops (`torch.linalg.svd`, batched matrix multiplies) onto CPU or Python `for` loops to accommodate local hardware.
+   - When writing or adjusting experiments, modify **only** the experiment script (`test_remote.py`). If a genuine architectural gap requires editing core source files, explain the exact location and complexity impact in Plan Mode and obtain user approval first.
+10. **Remote A100 Execution Only & Zero Data Fabrication (Anti-Reward-Hacking)**:
+    - **Never** execute PyTorch tests, probes, or training scripts locally on the Windows host (which risks WDDM TDR resets and Electron crashes on the 8GB laptop GPU). All execution must run on the remote A100 server via `python remote_bridge.py push` + `python remote_bridge.py exec "python test_remote.py"` (or `launch`).
+    - **Never** fabricate experimental results, inject synthetic noise/state (`activation_counts`, manual codebooks, external Python dictionaries like `_cjk_bigram_counts`, or hardcoded streamline indices) to make assertions pass. Always report genuine model outputs and diagnose real cold-start or theoretical gaps from first principles.
+11. **Occam's Razor & Framework Reuse First**:
+    - Whenever implementing a new feature or bridging a cold-start/architectural gap, **never** write a brand-new long-winded algorithm or Python loop from scratch.
+    - **Always** inspect the existing codebase (`BKPPackage`, `BKPManager`, `PMCPackage`, `PMCManager`, `PenroseHarness`) first and prioritize reusing or composing existing methods, reservoirs (`_low_hit_q1_reservoir`), and closed-form operators (`gumbel_aperture_threshold`, `nucleate_composite_word_sink`, `spawn_specialist_package_from_queries`, etc.) with minimal, vectorized code (~10 lines).
+
+# remote_bridge.py — COMMAND REFERENCE (ground truth)
+Global: every invocation tees stdout/stderr into `F:\Penrose\workspace\bridge_last.log`. VS Code shell integration frequently reports `Command completion could not be observed` / `exit code 1` even when the command succeeded — **do not re-run it**; check `workspace\bridge_last.log` once instead.
+
+| Command | Purpose / key flags |
+| --- | --- |
+| `push [files...] [-f]` (alias `sync`) | Upload changed `*.py *.sh requirements.txt README.md` (excludes `remote_bridge.py` itself, `workspace*`, `__pycache__`, `.git`, secrets). Auto CRLF->LF for `.sh/.py/.txt/.md/.json/.yaml/.yml`, per-file MD5 skip, `chmod +x` for `.sh`, final remote MD5 re-verify. |
+| `login` (alias `relogin`) / `.\relogin_coder.ps1` | Checks `%APPDATA%\coderv2\session`; if expired (`You are signed out`), pops up an interactive PowerShell running `coder.exe --global-config %APPDATA%\coderv2 login <url>` and opens `<url>/cli-auth` for token paste. |
+| `pull-model <RUN>` | Pulls remote trained checkpoint to `workspace/kernels/<RUN>.pt` and `.bkp` forest to `workspace/bkp_store/<RUN>/*.bkp` (incremental resume supported). |
+| `pull [-r <RUN>] [paths...]` | `-r <RUN>` copies the whole remote `workspace/logs/<RUN>/` to local `workspace\logs\<RUN>\`; bare `paths` are remote-relative files. |
+| `exec [--raw] "<cmd>"` | Runs inside `/home/coder/Penrose` with conda `penrose` activated, via Base64 pipe (quoting-safe). `--raw` disables conda+cd. Keep `<cmd>` short (`tail -n 20 ...`, `grep ...`, `python test_remote.py`). |
+| `status [-r <RUN>]` | GPU (`nvidia-smi`), live `pretrain/verify` processes, newest log dirs; with `-r` also probes `exists / pid_alive / status.json / last_line`. |
+| `launch {quick\|full} <RUN> [-e K=V]... [-i N] [--notify] [extra...]` | Step 1 `push`; Step 2 remote `./run_experiment.sh <mode> <RUN> <extra>` (backgrounded, returns immediately); Step 3 **automatically spawns the hidden watcher daemon**. `-w/--watch` instead blocks the current terminal (avoid). |
+| `watch <RUN> [-i N] [--signal] [-d] [--notify]` | `--signal` = zero-poll block on remote `tail --pid`; `-d` = detach as daemon and return; without `--signal` it *polls every 10 s* (avoid). |
+| `analyze <RUN> [--pull]` | Parses local `train.log` + `metrics.jsonl` + `status.json` into a report and writes `workspace\logs\<RUN>\summary.json` (stage NLL curves, eval history, `.bkp` ablation `Delta_NLL` / `PPL 恶化幅度`, diagnostics, tail samples). |
+| `push-data [targets...] [-f]` (alias `data-push`) | Atomic incremental sync of `workspace/datasets/<name>` or `workspace/tokenized_bins` (`.bin`/`meta.json`/tokenizer). |
+| `list-data` (alias `data-list`) | Side-by-side local vs remote dataset inventory (`train_tokens` / `val_tokens` / MB). |
+| `prep-data {general\|math\|code\|wiki_sci}... [--total-mb 200] [--out-dataset X] [--step all\|download\|tokenizer\|compile] [--no-push] [-d]` | Local `E:\miniconda\envs\NNpython` streaming corpus build, then auto `push-data`. `-d` runs it hidden in background (`workspace\logs\prep_*\prep.log`). |
+
+
+# ANTI-POLLING PROTOCOL (why `launch` needs no follow-up)
+`launch` does three things in one shot: push -> remote background start -> spawn **one deduplicated hidden watcher** (`pythonw.exe`, `CREATE_NO_WINDOW`; a stale process recorded in `workspace\logs\<RUN>\watcher.pid` is killed first). That watcher:
+1. blocks in the remote Linux kernel via `tail --pid=<PID> -f /dev/null` (0 % CPU, 0 polling requests),
+2. additionally waits until `verify_bicamera.py` has written a terminal `status.json` (`succeeded` / `failed`) so the ablation + samples are complete,
+3. then `scp`-pulls `train.log / metrics.jsonl / status.json` into `workspace\logs\<RUN>\`, writes `summary.json`, prints the report into `watcher_daemon.log`, and pops exactly **one** Windows toast.
+
+=> **After `launch` (or `watch --signal -d`), END YOUR TURN.** Do not sleep, do not re-exec, do not `status` in a loop, do not `analyze --pull` repeatedly.
+
+Authoritative "done" signals (check **at most once**):
+- `F:\Penrose\workspace\logs\<RUN>\summary.json` exists, or
+- `workspace\logs\<RUN>\watcher_daemon.log` contains `收到远端完成信号`.
+
+Escalation only if the run is clearly stuck (> 2x expected wall time): **one** `python remote_bridge.py status -r <RUN>`. If `pid_alive=false` but no `summary.json`, then **one** `python remote_bridge.py analyze <RUN> --pull`. Never more.
+
+Expected wall time: `quick` ≈ 13–15 min (300+50+100+50 steps + verify); `full` ≈ 2.5–3 h.
+
+# TEST_SCRIPT STANDARD (all remote diagnostics)
+Write the test **locally** in `F:\Penrose\test_remote.py`, then:
+`python remote_bridge.py push` -> `python remote_bridge.py exec "python test_remote.py"`.
+Never inline the logic into the command line. Keep `F:\Penrose\test_remote.py` lean (~220 lines) with core architectural contract checks (`test_pointwise_causal_invariance`, `test_ema_update_does_not_affect_current_forward`, `test_meta_persistence_roundtrip`, `test_bkp_topology_split_merge_and_expand`, `test_openai_api_contract`). Whenever a one-off probe finishes, archive its snapshot into `F:\Penrose\workspace\experiment_log\<exp_name>/` and remove the one-off function from `test_remote.py`.
+
+# DUAL-MODEL DIVISION OF LABOR (`gemini-4-argon` vs `deepseek-v4p1-flash-1017`)
+- **Plan Mode (`gemini-4-argon`)**: mathematical derivation, root-cause diagnosis, architecture design, analysis of local `summary.json` / `train.log` / `metrics.jsonl`.
+- **Act Mode (`deepseek-v4p1-flash-1017`)**: apply pre-designed edits, `push`, `launch`, `exec "python test_remote.py"`, and (only when unavoidable) a **single** `analyze <RUN> --pull`. Act Mode must never sit in a polling loop.
