@@ -33,9 +33,11 @@ DEFAULT_RAW_CORPUS: List[str] = [
 def run_penrose_v1_training(
     steps: int = 20,
     lr_mpu: float = 1e-3,
-    device_str: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device_str: Optional[str] = None,
     use_full_2048: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    if device_str is None:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
     if use_full_2048 is None:
         if device.type == "cuda":
@@ -60,11 +62,8 @@ def run_penrose_v1_training(
     pmc_manager.mount_package(base_pmc, pin_to_l1=True)
     harness = PenroseHarness(mpu=mpu, pmc_manager=pmc_manager, device=device)
 
-    # 先凝聚几个高频中文复合词负散度汇点（验证冷启动 -> 自发成词闭环）
-    for w_pair in [("训练", "语料"), ("语料", "。"), ("流形", "处理器"), ("微专家", "分化")]:
-        harness.nucleate_composite_word_sink(w_pair[0], w_pair[1])
-
-    # 注意：仅 MPU 的 12 层 8 头元算子使用轻量优化器，外置 PMC 流形块 100% 使用 0 字节显存的 Kaczmarz 测地线直投！
+    # 注意：无需任何人工预先注册词表，高频共现短波包在 train_manifold_trajectory 中满闭式阈值 ceil(ln(8))=3 次即自发结晶复合词负散度汇点！
+    # 仅 MPU 的 12 层 8 头元算子使用轻量优化器，外置 PMC 流形块 100% 使用 0 字节显存的 Kaczmarz 测地线直投！
     mpu_opt = torch.optim.AdamW(mpu.parameters(), lr=lr_mpu, weight_decay=0.01)
 
     t0 = time.time()

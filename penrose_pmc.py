@@ -600,10 +600,95 @@ class PMCManager(BKPManager):
 
         su = torch.einsum("nhd,hkd->nhk", q1_psi.float(), u_cb.float()).mean(dim=1)
         sv = torch.einsum("nhd,hkd->nhk", q2_psi.float(), v_cb.float()).mean(dim=1)
-        r_star = su.argmax(dim=-1)
-        c_star = sv.argmax(dim=-1)
-        eids = r_star * pkg.grid_k + c_star
+
+        # 子键正交空白行列无冲突分配律（Collision-Free Subkey Page Frame Allocation）：
+        # su, sv 为 H=8 个 128 维子键头的平均内积（等效维度 D_BKP/2 = 1024），其随机正交极值门限为 tau_z*(K) / sqrt(D_BKP / 2)。
+        # 若当前波包与已激活行/列的最大子键共振 >= tau_subkey_match，则直接复用该存量行/列；
+        # 若低于该门限且存在未激活空白行/列，则从空白池中分配最佳空白行/列并即时锚定子键（同词自动复用，异词零哈希碰撞）！
+        k_grid = pkg.grid_k
+        tau_subkey_match = closed_form_gumbel_threshold(float(k_grid)) / math.sqrt(float(D_BKP // 2))
+        act_2d = (pkg.scales[:, 1] > 1e-6).view(k_grid, k_grid)
+        used_rows = act_2d.any(dim=1).clone()
+        used_cols = act_2d.any(dim=0).clone()
+
+        self._total_periodic_queries = getattr(self, "_total_periodic_queries", 0) + int(N)
+        if bool(used_rows.any()):
+            su_used_all = su.masked_fill(~used_rows.unsqueeze(0), -1e9)
+            max_su_all, _ = su_used_all.max(dim=-1)
+            unseen_mask = max_su_all < tau_subkey_match
+            n_unseen = int(unseen_mask.sum().item())
+            if n_unseen > 0:
+                self._low_hit_periodic_queries = getattr(self, "_low_hit_periodic_queries", 0) + n_unseen
+                q1_un = q1_psi[unseen_mask].detach()
+                q2_un = q2_psi[unseen_mask].detach()
+                if self._low_hit_q1_reservoir is None:
+                    self._low_hit_q1_reservoir = q1_un
+                    self._low_hit_q2_reservoir = q2_un
+                else:
+                    self._low_hit_q1_reservoir = torch.cat([self._low_hit_q1_reservoir, q1_un], dim=0)[-512:]
+                    self._low_hit_q2_reservoir = torch.cat([self._low_hit_q2_reservoir, q2_un], dim=0)[-512:]
+
         dev = psi.device
+        q1_norm = F.normalize(q1_psi.float(), dim=-1)
+        q2_norm = F.normalize(q2_psi.float(), dim=-1)
+        u_cb_work = u_cb.float().clone()
+        v_cb_work = v_cb.float().clone()
+        r_star = torch.empty(N, dtype=torch.long, device=dev)
+        c_star = torch.empty(N, dtype=torch.long, device=dev)
+
+        for idx_n in range(N):
+            q1_i = q1_norm[idx_n]  # (H, 128)
+            su_i = torch.einsum("hd,hkd->k", q1_i, u_cb_work) / float(BKP_NUM_HEADS)
+            if bool(used_rows.any()):
+                su_u = su_i.masked_fill(~used_rows, -1e9)
+                max_u, best_ru = su_u.max(dim=-1)
+                if float(max_u.item()) >= tau_subkey_match or bool(used_rows.all()):
+                    r_sel = best_ru
+                else:
+                    r_sel = su_i.masked_fill(used_rows, -1e9).argmax(dim=-1)
+                    used_rows[r_sel] = True
+                    u_cb_work[:, r_sel, :] = q1_i
+                    pkg.u_codebook.data[:, r_sel, :] = q1_i
+            else:
+                r_sel = su_i.argmax(dim=-1)
+                used_rows[r_sel] = True
+                u_cb_work[:, r_sel, :] = q1_i
+                pkg.u_codebook.data[:, r_sel, :] = q1_i
+            r_star[idx_n] = r_sel
+
+            q2_i = q2_norm[idx_n]  # (H, 128)
+            sv_i = torch.einsum("hd,hkd->k", q2_i, v_cb_work) / float(BKP_NUM_HEADS)
+            row_act_cols = torch.nonzero(act_2d[r_sel], as_tuple=False).squeeze(-1)
+            if row_act_cols.numel() > 0:
+                # 若命中行 r_sel 已存在活跃微专家（含 Auto-Mitosis 分裂出的伴随列），优先对焦载荷同向 (cos >= 1/sqrt(2)) 的分支列
+                row_eids_i = r_sel * k_grid + row_act_cols
+                _, v_row_i = pkg.dequantize_expert_uv(row_eids_i)
+                cos_v_i = F.cosine_similarity(v_desired[idx_n : idx_n + 1], v_row_i, dim=-1)
+                best_cos_vi, best_pos_vi = cos_v_i.max(dim=-1)
+                if float(best_cos_vi.item()) >= SIMPLEX_2_GEODESIC_PROJ:
+                    c_sel = row_act_cols[best_pos_vi]
+                else:
+                    c_sel = row_act_cols[0]
+            elif bool(used_cols.any()):
+                sv_u = sv_i.masked_fill(~used_cols, -1e9)
+                max_v, best_cu = sv_u.max(dim=-1)
+                if float(max_v.item()) >= tau_subkey_match or bool(used_cols.all()):
+                    c_sel = best_cu
+                else:
+                    c_sel = sv_i.masked_fill(used_cols, -1e9).argmax(dim=-1)
+                    used_cols[c_sel] = True
+                    v_cb_work[:, c_sel, :] = q2_i
+                    pkg.v_codebook.data[:, c_sel, :] = q2_i
+            else:
+                c_sel = sv_i.argmax(dim=-1)
+                used_cols[c_sel] = True
+                v_cb_work[:, c_sel, :] = q2_i
+                pkg.v_codebook.data[:, c_sel, :] = q2_i
+            c_star[idx_n] = c_sel
+
+        pkg._u_cb_norm_cache = None
+        pkg._v_cb_norm_cache = None
+        eids = r_star * k_grid + c_star
 
         # 构造与 query_and_inject 完全对齐的标准化球面查询向量 q_sphere_psi
         q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
@@ -799,16 +884,23 @@ class PMCManager(BKPManager):
             mitosis_count = int(m_psi.size(0))
 
             empty_mask_2d = (pkg.scales[:, 1] <= 1e-6).view(pkg.grid_k, pkg.grid_k).clone()
+            col_unused_1d = empty_mask_2d.all(dim=0).clone()
             target_eids = torch.empty(mitosis_count, dtype=torch.long, device=dev)
             target_cols = torch.empty(mitosis_count, dtype=torch.long, device=dev)
+            bday_row_limit = max(4, int(math.isqrt(pkg.grid_k)))
             for m_i in range(mitosis_count):
                 r_i = m_rows[m_i]
                 avail_c = torch.nonzero(empty_mask_2d[r_i], as_tuple=False).squeeze(-1)
                 if avail_c.numel() > 0:
-                    c_sel = avail_c[0]
+                    # 优先选择全局尚未被任何行占用的空白列，避免旋转列子键影响其他行
+                    unused_avail = avail_c[col_unused_1d[avail_c]]
+                    c_sel = unused_avail[0] if unused_avail.numel() > 0 else avail_c[0]
                     empty_mask_2d[r_i, c_sel] = False
+                    col_unused_1d[c_sel] = False
                     target_cols[m_i] = c_sel
                     target_eids[m_i] = r_i * pkg.grid_k + c_sel
+                    if int((~empty_mask_2d[r_i]).sum().item()) >= bday_row_limit:
+                        pkg._needs_quadrant_expand = True
                 else:
                     pkg._needs_quadrant_expand = True
                     any_emp = torch.nonzero(empty_mask_2d.view(-1), as_tuple=False).squeeze(-1)
@@ -902,25 +994,23 @@ class PMCManager(BKPManager):
     ) -> Dict[str, Any]:
         N = eids.size(0)
         dev = eids.device
-        sv_2d = pkg.scales[:, 1].view(pkg.grid_k, pkg.grid_k)
-        for r_val in torch.unique(r_star):
-            r_int = int(r_val.item())
-            act_cols = torch.nonzero(sv_2d[r_int] > 1e-6, as_tuple=False).squeeze(-1)
-            if act_cols.numel() == 0:
-                eids[r_star == r_val] = -1
-                continue
-            row_eids = r_int * pkg.grid_k + act_cols
-            _, v_row = pkg.dequantize_expert_uv(row_eids)
-            tok_mask = r_star == r_val
-            v_er_sub = F.normalize(v_erase[tok_mask], dim=-1)
-            cos_mat = torch.matmul(v_er_sub, F.normalize(v_row, dim=-1).t())
-            best_cos, best_pos = cos_mat.max(dim=-1)
-            matched_eids = row_eids[best_pos]
-            eids[tok_mask] = torch.where(
-                best_cos >= SIMPLEX_3_BARYCENTER_PROJ,
-                matched_eids,
-                torch.full_like(matched_eids, -1),
-            )
+        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
+        act_eids = torch.nonzero(pkg.scales[:, 1] > 1e-6, as_tuple=False).squeeze(-1)
+        if act_eids.numel() == 0:
+            return {
+                "apoptosis_pages": 0,
+                "peeled_shared_pages": 0,
+                "severed_streamlines": 0,
+                "optimizer_memory_bytes": 0,
+            }
+
+        u_act, v_act = pkg.dequantize_expert_uv(act_eids)
+        cos_u_mat = torch.matmul(q_sphere_psi, F.normalize(u_act, dim=-1).t())
+        cos_v_mat = torch.matmul(F.normalize(v_erase, dim=-1), F.normalize(v_act, dim=-1).t())
+        valid_match = (cos_u_mat >= SIMPLEX_3_BARYCENTER_PROJ) & (cos_v_mat >= SIMPLEX_3_BARYCENTER_PROJ)
+        joint_score = torch.where(valid_match, cos_u_mat + cos_v_mat, torch.full_like(cos_u_mat, -1e9))
+        best_score, best_idx = joint_score.max(dim=-1)
+        eids = torch.where(best_score > -1e8, act_eids[best_idx], torch.full_like(eids, -1))
 
         severed_streamlines = 0
         if N > 1:
@@ -936,8 +1026,6 @@ class PMCManager(BKPManager):
                 "severed_streamlines": int(severed_streamlines),
                 "optimizer_memory_bytes": 0,
             }
-
-        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
         unique_eids, inverse_indices, hit_counts = torch.unique(
             eids[valid_tok_mask], sorted=True, return_inverse=True, return_counts=True
         )

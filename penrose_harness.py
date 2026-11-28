@@ -317,19 +317,45 @@ class HolographicWavepacketTransducer(nn.Module):
                         wavepackets.append(self.encode_bytes_to_wavepacket(sub_b))
                         chunks_out.append(sub_s)
             else:
-                # CJK 连续字符流：实时试探 PMC 负散度吸引盆漏斗
+                # CJK 连续字符流：实时试探 PMC 负散度吸引盆漏斗（批量一次性探查所有候选子串以消除逐字 kernel 启动开销）
                 pos = 0
                 m_len = len(run_str)
+                max_k_cap = max(1, min(4, self.max_slots // 3))
+                cand_cache: Dict[str, Tuple[bool, float, torch.Tensor]] = {}
+                if pmc_manager is not None and len(pmc_manager.mounted_packages) > 0 and m_len > 0:
+                    unique_cands: List[str] = []
+                    seen_cands = set()
+                    for p_i in range(m_len):
+                        for k_i in range(1, min(max_k_cap, m_len - p_i) + 1):
+                            cs = run_str[p_i : p_i + k_i]
+                            if cs not in seen_cands:
+                                seen_cands.add(cs)
+                                unique_cands.append(cs)
+                    q_batch = torch.stack([self.encode_string_to_wavepacket(cs) for cs in unique_cands], dim=0)
+                    diag_b = pmc_manager.query_with_helmholtz_diagnostics(q_batch.unsqueeze(1))
+                    res_list = diag_b.max_resonance.reshape(-1).tolist()
+                    div_list = diag_b.div_v.reshape(-1).tolist()
+                    for idx_c, cs in enumerate(unique_cands):
+                        cap_c = (res_list[idx_c] > FUNNEL_RESONANCE_APERTURE) and (div_list[idx_c] < GUMBEL_SINK_DIV_STAR)
+                        eff_d = float(div_list[idx_c]) if cap_c else 0.0
+                        cand_cache[cs] = (cap_c, eff_d, q_batch[idx_c])
+
                 while pos < m_len:
                     best_str = run_str[pos]
-                    best_q = self.encode_string_to_wavepacket(best_str)
-                    _, curr_div, _ = self._probe_negative_divergence_funnel(best_str, pmc_manager)
+                    if best_str in cand_cache:
+                        _, curr_div, best_q = cand_cache[best_str]
+                    else:
+                        best_q = self.encode_string_to_wavepacket(best_str)
+                        _, curr_div, _ = self._probe_negative_divergence_funnel(best_str, pmc_manager)
 
                     # 向前试探合并第 2 ~ 4 个汉字（最多不超过 max_slots // 3 个汉字）
                     max_cjk_chars = min(4, self.max_slots // 3, m_len - pos)
                     for k_try in range(2, max_cjk_chars + 1):
                         cand_str = run_str[pos : pos + k_try]
-                        captured, cand_div, cand_q = self._probe_negative_divergence_funnel(cand_str, pmc_manager)
+                        if cand_str in cand_cache:
+                            captured, cand_div, cand_q = cand_cache[cand_str]
+                        else:
+                            captured, cand_div, cand_q = self._probe_negative_divergence_funnel(cand_str, pmc_manager)
                         if captured and cand_div < curr_div:
                             best_str = cand_str
                             best_q = cand_q
@@ -369,7 +395,18 @@ class PenroseHarness(nn.Module):
     ) -> None:
         super().__init__()
         self.device = device
-        self.mpu = (mpu or PenroseMPU()).to(device)
+        if mpu is None:
+            if device.type == "cuda":
+                vram_gb = torch.cuda.get_device_properties(device).total_memory / float(1024**3)
+                default_cfg = (
+                    PenroseMPUConfig.preset_penrose_full_2048()
+                    if vram_gb >= 16.0
+                    else PenroseMPUConfig.preset_penrose_agile_12l()
+                )
+            else:
+                default_cfg = PenroseMPUConfig.preset_penrose_agile_12l()
+            mpu = PenroseMPU(default_cfg)
+        self.mpu = mpu.to(device)
         self.pmc_manager = pmc_manager or PMCManager(device=device)
         self.transducer = HolographicWavepacketTransducer(device=device)
         self.manifold_step: int = 0
@@ -413,18 +450,28 @@ class PenroseHarness(nn.Module):
         # 构造强负散度向心载荷：v_m = -sink_strength * q_word + v_tan，保证 <u_m, v_m> = -sink_strength * d < 0
         v_sink = (-float(sink_strength) * q_word + v_tan) * math.sqrt(float(D_BKP))
 
-        # 寻找空白格点或最佳匹配格点写入
-        empty_eids = torch.nonzero(pkg.scales[:, 1] <= 1e-6, as_tuple=False).squeeze(-1)
-        if empty_eids.numel() > 0:
-            eid = int(empty_eids[0].item())
+        # 优先挑选整行与整列均未占用的空白坐标 (r_idx, c_idx)，避免覆盖存量微专家的子键寻址
+        k_grid = pkg.grid_k
+        act_2d = (pkg.scales[:, 1] > 1e-6).view(k_grid, k_grid)
+        empty_rows = torch.nonzero(~act_2d.any(dim=1), as_tuple=False).squeeze(-1)
+        empty_cols = torch.nonzero(~act_2d.any(dim=0), as_tuple=False).squeeze(-1)
+        if empty_rows.numel() > 0 and empty_cols.numel() > 0:
+            r_idx = int(empty_rows[0].item())
+            c_idx = int(empty_cols[0].item())
+            eid = r_idx * k_grid + c_idx
         else:
-            eid = 0
-        r_idx = eid // pkg.grid_k
-        c_idx = eid % pkg.grid_k
-        q_heads = F.normalize(q_word.view(BKP_NUM_HEADS, 2, 128), dim=-1)
-        pkg.u_codebook.data[:, r_idx, :] = q_heads[:, 0, :]
-        pkg.v_codebook.data[:, c_idx, :] = q_heads[:, 1, :]
+            empty_eids = torch.nonzero(pkg.scales[:, 1] <= 1e-6, as_tuple=False).squeeze(-1)
+            eid = int(empty_eids[0].item()) if empty_eids.numel() > 0 else 0
+            r_idx = eid // k_grid
+            c_idx = eid % k_grid
+
+        q1_w, q2_w = self.pmc_manager._standardize_subqueries(q_word.view(1, D_BKP), update_center=False)
+        pkg.u_codebook.data[:, r_idx, :] = F.normalize(q1_w[0], dim=-1)
+        pkg.v_codebook.data[:, c_idx, :] = F.normalize(q2_w[0], dim=-1)
+        pkg._u_cb_norm_cache = None
+        pkg._v_cb_norm_cache = None
         pkg.quantize_write_expert_page(eid, q_word, v_sink, hit_increment=5.0, purity_val=1.0)
+        self.pmc_manager.vram_cache.invalidate_or_refresh(pkg, torch.tensor([eid], device=self.device, dtype=torch.long))
         return eid
 
     @torch.no_grad()
@@ -538,6 +585,7 @@ class PenroseHarness(nn.Module):
                 loss_before = float(out_before.loss.detach().cpu()) if out_before.loss is not None else 1.0
 
         # 1. PMC 无 AdamW 闭式 Kaczmarz + 罗德里格斯大圆旋转一步批处理锁死
+        self.pmc_manager.train(True)
         kaczmarz_stats = self.pmc_manager.geodesic_kaczmarz_snap_update(
             q_curr=q_curr,
             q_prev=q_prev,
@@ -563,6 +611,22 @@ class PenroseHarness(nn.Module):
                 layer.moe.update_expert_bias()
             train_loss = float(out_train.loss.detach().cpu())
 
+        if eval_before_after:
+            with torch.no_grad():
+                self.mpu.eval()
+                self.pmc_manager.train(True)
+                out_after = self.mpu(q_curr, q_prev=q_prev, pmc_manager=self.pmc_manager, q_target=q_target)
+                loss_after = float(out_after.loss.detach().cpu()) if out_after.loss is not None else 0.0
+        else:
+            if train_loss is None:
+                with torch.no_grad():
+                    self.mpu.eval()
+                    self.pmc_manager.train(True)
+                    out_single = self.mpu(q_curr, q_prev=q_prev, pmc_manager=self.pmc_manager, q_target=q_target)
+                    train_loss = float(out_single.loss.detach().cpu()) if out_single.loss is not None else 0.0
+            loss_before = train_loss
+            loss_after = train_loss
+
         # 3. 按时间步或满载信号自动触发 PMCManager 内聚的六大森林自治演化算子
         forest_events: List[Dict[str, Any]] = []
         pkg_w = self.pmc_manager.get_writable_package()
@@ -573,20 +637,6 @@ class PenroseHarness(nn.Module):
                 q_probe=q_curr,
                 domain_hint=domain_hint,
             )
-
-        if eval_before_after:
-            with torch.no_grad():
-                self.mpu.eval()
-                out_after = self.mpu(q_curr, q_prev=q_prev, pmc_manager=self.pmc_manager, q_target=q_target)
-                loss_after = float(out_after.loss.detach().cpu()) if out_after.loss is not None else 0.0
-        else:
-            if train_loss is None:
-                with torch.no_grad():
-                    self.mpu.eval()
-                    out_single = self.mpu(q_curr, q_prev=q_prev, pmc_manager=self.pmc_manager, q_target=q_target)
-                    train_loss = float(out_single.loss.detach().cpu()) if out_single.loss is not None else 0.0
-            loss_before = train_loss
-            loss_after = train_loss
 
         curr_loss = train_loss if train_loss is not None else loss_after
         return {
