@@ -395,18 +395,7 @@ class PenroseHarness(nn.Module):
     ) -> None:
         super().__init__()
         self.device = device
-        if mpu is None:
-            if device.type == "cuda":
-                vram_gb = torch.cuda.get_device_properties(device).total_memory / float(1024**3)
-                default_cfg = (
-                    PenroseMPUConfig.preset_penrose_full_2048()
-                    if vram_gb >= 16.0
-                    else PenroseMPUConfig.preset_penrose_agile_12l()
-                )
-            else:
-                default_cfg = PenroseMPUConfig.preset_penrose_agile_12l()
-            mpu = PenroseMPU(default_cfg)
-        self.mpu = mpu.to(device)
+        self.mpu = (mpu or PenroseMPU()).to(device)
         self.pmc_manager = pmc_manager or PMCManager(device=device)
         self.transducer = HolographicWavepacketTransducer(device=device)
         self.manifold_step: int = 0
@@ -593,6 +582,17 @@ class PenroseHarness(nn.Module):
             snap_rate=snap_rate,
             enable_auto_mitosis=enable_auto_mitosis,
         )
+        # 流线偶极坍缩成词 (Streamline Dipole Nucleation): 对已锁死流线直接复用 nucleate_composite_word_sink 结晶复合词漏斗
+        for d_idx in kaczmarz_stats.get("locked_dipole_indices", []):
+            if d_idx + 1 < len(surface_chunks):
+                w1, w2 = surface_chunks[d_idx], surface_chunks[d_idx + 1]
+                if (
+                    len(w1) + len(w2) <= 4
+                    and self.transducer.classify_char_phase(w1[0]) == UnicodePhaseClass.CJK_IDEOGRAPH
+                    and self.transducer.classify_char_phase(w2[0]) == UnicodePhaseClass.CJK_IDEOGRAPH
+                ):
+                    next_w = surface_chunks[d_idx + 2] if (d_idx + 2 < len(surface_chunks)) else None
+                    self.nucleate_composite_word_sink(w1 + w2, next_w)
 
         # 2. 若处于 MPU 联合训练阶段（分支 C 并行训练），单步仅执行 1 次 mpu(...) 前向与反向传播
         train_loss: Optional[float] = None

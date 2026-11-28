@@ -461,19 +461,38 @@ class PMCManager(BKPManager):
                 l1_writable.append(pkg)
         if len(l1_writable) == 0:
             return self.get_writable_package()
-        if len(l1_writable) == 1:
-            return l1_writable[0]
 
-        psi_probe = psi.detach().float().reshape(-1, D_BKP)[:16]
+        psi_probe = psi.detach().float().reshape(-1, D_BKP)
         q1, q2 = self._standardize_subqueries(psi_probe, update_center=False)
+        q1_u, q2_u = F.normalize(q1[:16].float(), dim=-1), F.normalize(q2[:16].float(), dim=-1)
         best_pkg = l1_writable[-1]
         best_score = -1e9
         for chart in l1_writable:
-            s1_c, s2_c, _, _ = self._precompute_pkg_subkey_scores(chart, q1, q2)
-            score = float((0.5 * (s1_c.amax(dim=-1).mean() + s2_c.amax(dim=-1).mean())).item())
+            u_cb, v_cb = chart.normalized_codebooks()
+            act_2d = (chart.scales[:, 1] > 1e-6).view(chart.grid_k, chart.grid_k)
+            ur, uc = act_2d.any(dim=1), act_2d.any(dim=0)
+            if bool(ur.any()):
+                su_c = torch.einsum("nhd,hkd->nhk", q1_u, u_cb.float()).mean(dim=1).masked_fill(~ur.unsqueeze(0), -1e9)
+                sv_c = torch.einsum("nhd,hkd->nhk", q2_u, v_cb.float()).mean(dim=1).masked_fill(~uc.unsqueeze(0), -1e9)
+                score = float((0.5 * (su_c.max(dim=-1).values.mean() + sv_c.max(dim=-1).values.mean())).item())
+            else:
+                score = 0.0
             if score >= best_score:
                 best_score = score
                 best_pkg = chart
+
+        # 坐标卡 Gumbel 视界地平线 (Chart Horizon Gate): 若现有坐标卡已成核但新波包共振低于公理 2 视界阈值，则收入 _low_hit_q1_reservoir 供 Auto-Spawn 孵化新包
+        if bool((best_pkg.scales[:, 1] > 1e-6).any()):
+            tau_horizon = SIMPLEX_3_BARYCENTER_PROJ
+            self._total_periodic_queries = getattr(self, "_total_periodic_queries", 0) + int(q1.size(0))
+            if best_score < tau_horizon:
+                self._low_hit_periodic_queries = getattr(self, "_low_hit_periodic_queries", 0) + int(q1.size(0))
+                self._low_hit_q1_reservoir = (
+                    q1 if self._low_hit_q1_reservoir is None else torch.cat([self._low_hit_q1_reservoir, q1], dim=0)[-512:]
+                )
+                self._low_hit_q2_reservoir = (
+                    q2 if self._low_hit_q2_reservoir is None else torch.cat([self._low_hit_q2_reservoir, q2], dim=0)[-512:]
+                )
         return best_pkg
 
     @torch.no_grad()
@@ -596,104 +615,67 @@ class PMCManager(BKPManager):
 
         # 100% 复用 BKPManager._standardize_subqueries 与 normalized_codebooks，确保 Kaczmarz 写入与测地圆读取共享同一子键流形坐标系！
         q1_psi, q2_psi = self._standardize_subqueries(psi, update_center=False)
+        q1_unit = F.normalize(q1_psi.float(), dim=-1)
+        q2_unit = F.normalize(q2_psi.float(), dim=-1)
         u_cb, v_cb = pkg.normalized_codebooks()
 
-        su = torch.einsum("nhd,hkd->nhk", q1_psi.float(), u_cb.float()).mean(dim=1)
-        sv = torch.einsum("nhd,hkd->nhk", q2_psi.float(), v_cb.float()).mean(dim=1)
-
-        # 子键正交空白行列无冲突分配律（Collision-Free Subkey Page Frame Allocation）：
-        # su, sv 为 H=8 个 128 维子键头的平均内积（等效维度 D_BKP/2 = 1024），其随机正交极值门限为 tau_z*(K) / sqrt(D_BKP / 2)。
-        # 若当前波包与已激活行/列的最大子键共振 >= tau_subkey_match，则直接复用该存量行/列；
-        # 若低于该门限且存在未激活空白行/列，则从空白池中分配最佳空白行/列并即时锚定子键（同词自动复用，异词零哈希碰撞）！
-        k_grid = pkg.grid_k
-        tau_subkey_match = closed_form_gumbel_threshold(float(k_grid)) / math.sqrt(float(D_BKP // 2))
-        act_2d = (pkg.scales[:, 1] > 1e-6).view(k_grid, k_grid)
-        used_rows = act_2d.any(dim=1).clone()
-        used_cols = act_2d.any(dim=0).clone()
-
-        self._total_periodic_queries = getattr(self, "_total_periodic_queries", 0) + int(N)
-        if bool(used_rows.any()):
-            su_used_all = su.masked_fill(~used_rows.unsqueeze(0), -1e9)
-            max_su_all, _ = su_used_all.max(dim=-1)
-            unseen_mask = max_su_all < tau_subkey_match
-            n_unseen = int(unseen_mask.sum().item())
-            if n_unseen > 0:
-                self._low_hit_periodic_queries = getattr(self, "_low_hit_periodic_queries", 0) + n_unseen
-                q1_un = q1_psi[unseen_mask].detach()
-                q2_un = q2_psi[unseen_mask].detach()
-                if self._low_hit_q1_reservoir is None:
-                    self._low_hit_q1_reservoir = q1_un
-                    self._low_hit_q2_reservoir = q2_un
-                else:
-                    self._low_hit_q1_reservoir = torch.cat([self._low_hit_q1_reservoir, q1_un], dim=0)[-512:]
-                    self._low_hit_q2_reservoir = torch.cat([self._low_hit_q2_reservoir, q2_un], dim=0)[-512:]
-
+        su = torch.einsum("nhd,hkd->nhk", q1_unit, u_cb.float()).mean(dim=1)
+        sv = torch.einsum("nhd,hkd->nhk", q2_unit, v_cb.float()).mean(dim=1)
+        r_star = su.argmax(dim=-1)
+        c_star = sv.argmax(dim=-1)
         dev = psi.device
-        q1_norm = F.normalize(q1_psi.float(), dim=-1)
-        q2_norm = F.normalize(q2_psi.float(), dim=-1)
-        u_cb_work = u_cb.float().clone()
-        v_cb_work = v_cb.float().clone()
-        r_star = torch.empty(N, dtype=torch.long, device=dev)
-        c_star = torch.empty(N, dtype=torch.long, device=dev)
-
-        for idx_n in range(N):
-            q1_i = q1_norm[idx_n]  # (H, 128)
-            su_i = torch.einsum("hd,hkd->k", q1_i, u_cb_work) / float(BKP_NUM_HEADS)
-            if bool(used_rows.any()):
-                su_u = su_i.masked_fill(~used_rows, -1e9)
-                max_u, best_ru = su_u.max(dim=-1)
-                if float(max_u.item()) >= tau_subkey_match or bool(used_rows.all()):
-                    r_sel = best_ru
-                else:
-                    r_sel = su_i.masked_fill(used_rows, -1e9).argmax(dim=-1)
-                    used_rows[r_sel] = True
-                    u_cb_work[:, r_sel, :] = q1_i
-                    pkg.u_codebook.data[:, r_sel, :] = q1_i
-            else:
-                r_sel = su_i.argmax(dim=-1)
-                used_rows[r_sel] = True
-                u_cb_work[:, r_sel, :] = q1_i
-                pkg.u_codebook.data[:, r_sel, :] = q1_i
-            r_star[idx_n] = r_sel
-
-            q2_i = q2_norm[idx_n]  # (H, 128)
-            sv_i = torch.einsum("hd,hkd->k", q2_i, v_cb_work) / float(BKP_NUM_HEADS)
-            row_act_cols = torch.nonzero(act_2d[r_sel], as_tuple=False).squeeze(-1)
-            if row_act_cols.numel() > 0:
-                # 若命中行 r_sel 已存在活跃微专家（含 Auto-Mitosis 分裂出的伴随列），优先对焦载荷同向 (cos >= 1/sqrt(2)) 的分支列
-                row_eids_i = r_sel * k_grid + row_act_cols
-                _, v_row_i = pkg.dequantize_expert_uv(row_eids_i)
-                cos_v_i = F.cosine_similarity(v_desired[idx_n : idx_n + 1], v_row_i, dim=-1)
-                best_cos_vi, best_pos_vi = cos_v_i.max(dim=-1)
-                if float(best_cos_vi.item()) >= SIMPLEX_2_GEODESIC_PROJ:
-                    c_sel = row_act_cols[best_pos_vi]
-                else:
-                    c_sel = row_act_cols[0]
-            elif bool(used_cols.any()):
-                sv_u = sv_i.masked_fill(~used_cols, -1e9)
-                max_v, best_cu = sv_u.max(dim=-1)
-                if float(max_v.item()) >= tau_subkey_match or bool(used_cols.all()):
-                    c_sel = best_cu
-                else:
-                    c_sel = sv_i.masked_fill(used_cols, -1e9).argmax(dim=-1)
-                    used_cols[c_sel] = True
-                    v_cb_work[:, c_sel, :] = q2_i
-                    pkg.v_codebook.data[:, c_sel, :] = q2_i
-            else:
-                c_sel = sv_i.argmax(dim=-1)
-                used_cols[c_sel] = True
-                v_cb_work[:, c_sel, :] = q2_i
-                pkg.v_codebook.data[:, c_sel, :] = q2_i
-            c_star[idx_n] = c_sel
-
-        pkg._u_cb_norm_cache = None
-        pkg._v_cb_norm_cache = None
-        eids = r_star * k_grid + c_star
 
         # 构造与 query_and_inject 完全对齐的标准化球面查询向量 q_sphere_psi
         q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
 
-        # 1. 向量化记录相邻时间步的测地流线转移边 (零循环)
+        # 冷启动码本球面孔径防撞烙印 (Anchor Collision Guard): 对低于公理 2 单纯形重心界 (1/sqrt(3)) 的未知波包，纯张量无循环烙印至空闲 (r, c)
+        k_grid = pkg.grid_k
+        tau_sub = SIMPLEX_3_BARYCENTER_PROJ
+        act_2d = (pkg.scales[:, 1] > 1e-6).view(k_grid, k_grid)
+        used_r, used_c = act_2d.any(dim=1), act_2d.any(dim=0)
+        if bool(used_r.any()):
+            max_su_used, best_r_used = su.masked_fill(~used_r.unsqueeze(0), -1e9).max(dim=-1)
+            need_imprint = max_su_used < tau_sub
+            r_star = torch.where(need_imprint, r_star, best_r_used)
+        else:
+            need_imprint = torch.ones(N, dtype=torch.bool, device=dev)
+        if bool(need_imprint.any()):
+            imp_idx = torch.nonzero(need_imprint, as_tuple=False).squeeze(-1)
+            q_imp = q_c[imp_idx]
+            first_rep = (torch.matmul(q_imp, q_imp.t()) >= SIMPLEX_2_GEODESIC_PROJ).int().argmax(dim=-1)
+            uniq_reps, inv_rep = torch.unique(first_rep, sorted=True, return_inverse=True)
+            avail_r = torch.nonzero(~used_r, as_tuple=False).squeeze(-1)
+            avail_c = torch.nonzero(~used_c, as_tuple=False).squeeze(-1)
+            n_alloc = min(int(uniq_reps.numel()), int(avail_r.numel()), int(avail_c.numel()))
+            if n_alloc > 0:
+                sel_r, sel_c = avail_r[:n_alloc], avail_c[:n_alloc]
+                rep_tok = imp_idx[uniq_reps[:n_alloc]]
+                pkg.u_codebook.data[:, sel_r, :] = q1_unit[rep_tok].permute(1, 0, 2)
+                pkg.v_codebook.data[:, sel_c, :] = q2_unit[rep_tok].permute(1, 0, 2)
+                pkg._u_cb_norm_cache = None
+                pkg._v_cb_norm_cache = None
+                valid_m = inv_rep < n_alloc
+                r_star[imp_idx[valid_m]] = sel_r[inv_rep[valid_m]]
+                c_star[imp_idx[valid_m]] = sel_c[inv_rep[valid_m]]
+
+        # 若命中的已激活行存在 Auto-Mitosis 分裂出的伴随列，对焦切向推力同向 (cos >= 1/sqrt(2)) 的分支列
+        for r_v in torch.unique(r_star[~need_imprint]):
+            act_cols = torch.nonzero(act_2d[r_v], as_tuple=False).squeeze(-1)
+            if act_cols.numel() > 0:
+                _, v_row = pkg.dequantize_expert_uv(r_v * k_grid + act_cols)
+                rmask = (~need_imprint) & (r_star == r_v)
+                cos_mat = torch.matmul(F.normalize(v_desired[rmask], dim=-1), F.normalize(v_row, dim=-1).t())
+                best_cos, best_pos = cos_mat.max(dim=-1)
+                c_star[rmask] = torch.where(best_cos >= SIMPLEX_2_GEODESIC_PROJ, act_cols[best_pos], act_cols[0])
+
+        eids = r_star * k_grid + c_star
+
+        # 1. 向量化检测已存在于 stream_next_ptr 的因果流线边，并记录当前批次新增转移边 (零循环)
+        in_stream_prev = (
+            (pkg.stream_next_ptr[eids[:-1]] == eids[1:].unsqueeze(-1)).any(dim=-1)
+            if N > 1
+            else torch.zeros(0, dtype=torch.bool, device=dev)
+        )
         if N > 1:
             diff_step = eids[:-1] != eids[1:]
             if bool(diff_step.any()):
@@ -705,7 +687,7 @@ class PMCManager(BKPManager):
         )
         u_cnt = int(unique_eids.numel())
         if u_cnt == 0:
-            return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0}
+            return {"updated_pages": 0, "mitosis_pages": 0, "optimizer_memory_bytes": 0, "locked_dipole_indices": []}
 
         psi_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
         v_des_sum = torch.zeros((u_cnt, D_BKP), dtype=torch.float32, device=dev)
@@ -715,18 +697,24 @@ class PMCManager(BKPManager):
         psi_bar = F.normalize(psi_sum * inv_cnt, dim=-1)
         v_des_bar = v_des_sum * inv_cnt
 
-        # 3. 批量读取唯一命中页的存量 (u_old, v_old) 与状态
+        # 3. 批量读取唯一命中页的存量 (u_old, v_old) 与状态，并按公理孔径 cos(pi/6)=sqrt(3)/2 识别已锁死流线偶极
         u_old, v_old = pkg.dequantize_expert_uv(unique_eids)
         is_empty_u = pkg.scales[unique_eids, 1] <= 1e-6
         cos_v_u = F.cosine_similarity(v_old, v_des_bar, dim=-1)
-
-        tok_to_bar_cos = F.cosine_similarity(v_desired, v_des_bar[inverse_indices], dim=-1)
-        intra_fork_mask = (hit_counts[inverse_indices] > 1) & (tok_to_bar_cos < SIMPLEX_2_GEODESIC_PROJ)
+        locked_dipole_indices: List[int] = []
+        if N > 1 and bool(in_stream_prev.any()):
+            inv_prev = inverse_indices[:-1]
+            cos_step = F.cosine_similarity(v_old[inv_prev], v_desired[:-1], dim=-1)
+            dipole_mask = in_stream_prev & (~is_empty_u[inv_prev]) & (cos_step > 0.5 * math.sqrt(3.0))
+            if bool(dipole_mask.any()):
+                locked_dipole_indices = torch.nonzero(dipole_mask, as_tuple=False).squeeze(-1).tolist()
 
         first_occ = torch.zeros(u_cnt, dtype=torch.long, device=dev)
+        rev_idx = torch.arange(N - 1, -1, -1, device=dev, dtype=torch.long)
+        first_occ.index_copy_(0, inverse_indices[rev_idx], rev_idx)
+        tok_to_first_cos = F.cosine_similarity(v_desired, v_desired[first_occ[inverse_indices]], dim=-1)
+        intra_fork_mask = (hit_counts[inverse_indices] > 1) & (tok_to_first_cos < SIMPLEX_2_GEODESIC_PROJ)
         if bool(intra_fork_mask.any()):
-            rev_idx = torch.arange(N - 1, -1, -1, device=dev, dtype=torch.long)
-            first_occ.index_copy_(0, inverse_indices[rev_idx], rev_idx)
             has_intra_u = torch.zeros(u_cnt, dtype=torch.bool, device=dev)
             has_intra_u.index_fill_(0, inverse_indices[intra_fork_mask], True)
             psi_bar = torch.where(has_intra_u.unsqueeze(-1), q_sphere_psi[first_occ], psi_bar)
@@ -737,12 +725,14 @@ class PMCManager(BKPManager):
 
         existing_mitosis_u = enable_auto_mitosis & (~is_empty_u) & (cos_v_u < SIMPLEX_2_GEODESIC_PROJ)
         direct_update_u = ~existing_mitosis_u
-        return self._apply_batched_kaczmarz_and_mitosis(
+        res_dict = self._apply_batched_kaczmarz_and_mitosis(
             pkg, unique_eids, inverse_indices, hit_counts, q_sphere_psi, v_desired, r_star,
             psi_bar, v_des_bar, u_old, v_old, is_empty_u, cos_v_u,
             direct_update_u, existing_mitosis_u, intra_fork_mask, first_occ,
             snap_rate, enable_auto_mitosis,
         )
+        res_dict["locked_dipole_indices"] = locked_dipole_indices
+        return res_dict
 
     @torch.no_grad()
     def _apply_batched_kaczmarz_and_mitosis(
@@ -892,7 +882,6 @@ class PMCManager(BKPManager):
                 r_i = m_rows[m_i]
                 avail_c = torch.nonzero(empty_mask_2d[r_i], as_tuple=False).squeeze(-1)
                 if avail_c.numel() > 0:
-                    # 优先选择全局尚未被任何行占用的空白列，避免旋转列子键影响其他行
                     unused_avail = avail_c[col_unused_1d[avail_c]]
                     c_sel = unused_avail[0] if unused_avail.numel() > 0 else avail_c[0]
                     empty_mask_2d[r_i, c_sel] = False
@@ -974,10 +963,12 @@ class PMCManager(BKPManager):
 
         q1_psi, q2_psi = self._standardize_subqueries(psi, update_center=False)
         u_cb, v_cb = pkg.normalized_codebooks()
-        su = torch.einsum("nhd,hkd->nhk", q1_psi.float(), u_cb.float()).mean(dim=1)
-        sv = torch.einsum("nhd,hkd->nhk", q2_psi.float(), v_cb.float()).mean(dim=1)
-        r_star = su.argmax(dim=-1)
-        c_star = sv.argmax(dim=-1)
+        su = torch.einsum("nhd,hkd->nhk", F.normalize(q1_psi.float(), dim=-1), u_cb.float()).mean(dim=1)
+        sv = torch.einsum("nhd,hkd->nhk", F.normalize(q2_psi.float(), dim=-1), v_cb.float()).mean(dim=1)
+        act_2d = (pkg.scales[:, 1] > 1e-6).view(pkg.grid_k, pkg.grid_k)
+        ur, uc = act_2d.any(dim=1), act_2d.any(dim=0)
+        r_star = su.masked_fill(~ur.unsqueeze(0), -1e9).argmax(dim=-1) if bool(ur.any()) else su.argmax(dim=-1)
+        c_star = sv.masked_fill(~uc.unsqueeze(0), -1e9).argmax(dim=-1) if bool(uc.any()) else sv.argmax(dim=-1)
         eids = r_star * pkg.grid_k + c_star
         return self._apply_batched_erase_downdate(pkg, r_star, eids, q1_psi, q2_psi, v_erase, erase_rate)
 
@@ -994,23 +985,25 @@ class PMCManager(BKPManager):
     ) -> Dict[str, Any]:
         N = eids.size(0)
         dev = eids.device
-        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
-        act_eids = torch.nonzero(pkg.scales[:, 1] > 1e-6, as_tuple=False).squeeze(-1)
-        if act_eids.numel() == 0:
-            return {
-                "apoptosis_pages": 0,
-                "peeled_shared_pages": 0,
-                "severed_streamlines": 0,
-                "optimizer_memory_bytes": 0,
-            }
-
-        u_act, v_act = pkg.dequantize_expert_uv(act_eids)
-        cos_u_mat = torch.matmul(q_sphere_psi, F.normalize(u_act, dim=-1).t())
-        cos_v_mat = torch.matmul(F.normalize(v_erase, dim=-1), F.normalize(v_act, dim=-1).t())
-        valid_match = (cos_u_mat >= SIMPLEX_3_BARYCENTER_PROJ) & (cos_v_mat >= SIMPLEX_3_BARYCENTER_PROJ)
-        joint_score = torch.where(valid_match, cos_u_mat + cos_v_mat, torch.full_like(cos_u_mat, -1e9))
-        best_score, best_idx = joint_score.max(dim=-1)
-        eids = torch.where(best_score > -1e8, act_eids[best_idx], torch.full_like(eids, -1))
+        sv_2d = pkg.scales[:, 1].view(pkg.grid_k, pkg.grid_k)
+        for r_val in torch.unique(r_star):
+            r_int = int(r_val.item())
+            act_cols = torch.nonzero(sv_2d[r_int] > 1e-6, as_tuple=False).squeeze(-1)
+            if act_cols.numel() == 0:
+                eids[r_star == r_val] = -1
+                continue
+            row_eids = r_int * pkg.grid_k + act_cols
+            _, v_row = pkg.dequantize_expert_uv(row_eids)
+            tok_mask = r_star == r_val
+            v_er_sub = F.normalize(v_erase[tok_mask], dim=-1)
+            cos_mat = torch.matmul(v_er_sub, F.normalize(v_row, dim=-1).t())
+            best_cos, best_pos = cos_mat.max(dim=-1)
+            matched_eids = row_eids[best_pos]
+            eids[tok_mask] = torch.where(
+                best_cos >= SIMPLEX_3_BARYCENTER_PROJ,
+                matched_eids,
+                torch.full_like(matched_eids, -1),
+            )
 
         severed_streamlines = 0
         if N > 1:
@@ -1026,6 +1019,8 @@ class PMCManager(BKPManager):
                 "severed_streamlines": int(severed_streamlines),
                 "optimizer_memory_bytes": 0,
             }
+
+        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(N, D_BKP).float(), dim=-1)
         unique_eids, inverse_indices, hit_counts = torch.unique(
             eids[valid_tok_mask], sorted=True, return_inverse=True, return_counts=True
         )
@@ -1223,9 +1218,17 @@ class PMCManager(BKPManager):
             pkg = self.packages[mk]
             if pkg.is_bridge_pkg or pkg.grid_k < 128:
                 continue
-            woken_cnt = int((pkg.activation_counts > 0).sum().item())
+            act_2d = pkg.activation_counts.view(pkg.grid_k, pkg.grid_k)
+            woken_cnt = int((act_2d > 0).sum().item())
+            act_rows = int((act_2d.sum(dim=1) > 0).sum().item())
             if woken_cnt < max(16, pkg.grid_k // 2):
                 continue
+            if "_Sub" in pid and woken_cnt < int(pkg.grid_k * pkg.grid_k * expand_woken_thresh):
+                continue
+            c_pre = pkg.crystallize_biorthogonal_manifold_closure(max_crystallize_slots=64)
+            n_pre = int(c_pre.get("crystallized_count", 0))
+            if n_pre > 0:
+                self.closure_count += n_pre
             split_res = pkg.bkp_split_spectral(cross_ratio_threshold=split_cross_max, return_bridge=True)
             if split_res is not None:
                 pkg_a, pkg_b, pkg_bridge = split_res

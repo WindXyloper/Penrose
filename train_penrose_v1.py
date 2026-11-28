@@ -34,17 +34,11 @@ def run_penrose_v1_training(
     steps: int = 20,
     lr_mpu: float = 1e-3,
     device_str: Optional[str] = None,
-    use_full_2048: Optional[bool] = None,
+    use_full_2048: bool = True,
 ) -> Dict[str, Any]:
     if device_str is None:
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
-    if use_full_2048 is None:
-        if device.type == "cuda":
-            vram_gb = torch.cuda.get_device_properties(device).total_memory / float(1024**3)
-            use_full_2048 = bool(vram_gb >= 16.0)
-        else:
-            use_full_2048 = False
     cfg = (
         PenroseMPUConfig.preset_penrose_full_2048()
         if use_full_2048
@@ -54,7 +48,7 @@ def run_penrose_v1_training(
     pmc_manager = PMCManager(device=device)
     base_pmc = PMCPackage(
         pkg_id="Base_v1.pmc",
-        grid_k=64,
+        grid_k=128,
         mount_mode=PMCMountMode.RW_SHARED,
         is_base_pkg=True,
         device=device,

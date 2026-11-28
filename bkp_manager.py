@@ -200,15 +200,14 @@ class BKPPackage(nn.Module):
         #        GPU 显存仅驻留 ~256KB 的 L1 路由子键页表 (u_codebook, v_codebook)，前向命中后通过 PCIe 按需拉取进入 VRAMReadOnlyExpertCache！
         is_rw = mount_mode in (BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE)
         n_slot = self.num_experts if is_rw else 0
-        self._gpu_resident_pages: bool = bool(is_rw and device.type == "cuda" and self.grid_k <= 64)
-        self._gpu_resident_train: bool = False
-        buf_dev = torch.device("cpu")
+        self._gpu_resident_pages: bool = bool(is_rw and device.type == "cuda" and self.grid_k <= 256)
+        self._gpu_resident_train: bool = bool(is_rw and device.type == "cuda" and self.grid_k <= 256)
+        buf_dev = device if self._gpu_resident_train else torch.device("cpu")
         grad_dtype = torch.float32
 
-        # Penrose v1.0 采用无 AdamW 的一步 Kaczmarz 测地线流形锁死，默认零优化器动量与零冗余 BF16 主权重副本分配 (0 Bytes)
-        self._sparse_steps_cpu: torch.Tensor = torch.zeros(0, dtype=torch.int32, device=buf_dev)
-        self._sparse_m1_cpu: torch.Tensor = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
-        self._sparse_m2_cpu: torch.Tensor = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
+        self._sparse_steps_cpu: torch.Tensor = torch.zeros(n_slot, dtype=torch.int32, device=buf_dev)
+        self._sparse_m1_cpu: torch.Tensor = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+        self._sparse_m2_cpu: torch.Tensor = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
         self._grad_acc_cpu: torch.Tensor = torch.zeros(0, dtype=grad_dtype, device=buf_dev)
         self._grad_hit_counts: torch.Tensor = torch.zeros(0, dtype=torch.float32, device=buf_dev)
         self._grad_dirty_mask: torch.Tensor = torch.zeros(n_slot, dtype=torch.bool, device=device)
@@ -218,7 +217,14 @@ class BKPPackage(nn.Module):
         )
         self._last_active_eids: Optional[torch.Tensor] = None
         self._frozen_expert_mask_cpu: Optional[torch.Tensor] = None
-        self._master_uv_fp32: Optional[torch.Tensor] = None
+
+        # 5. 训练态未量化主权重池 (Master Weights, 统一使用 bfloat16 节省 50% 主权重显存):
+        master_dtype = torch.bfloat16
+        self._master_uv_fp32: Optional[torch.Tensor] = (
+            torch.zeros((n_slot, 2, D_BKP), dtype=master_dtype, device=buf_dev) if is_rw else None
+        )
+        if self._master_uv_fp32 is not None:
+            self._init_master_from_pages()
 
     @torch.no_grad()
     def _init_master_from_pages(self) -> None:
@@ -233,11 +239,8 @@ class BKPPackage(nn.Module):
         scale = self.scales.to(device=dev, dtype=self._master_uv_fp32.dtype).unsqueeze(-1)
         self._master_uv_fp32.mul_(scale)
         u = self._master_uv_fp32[:, 0, :]
-        rms_scale = math.sqrt(float(D_BKP))
-        for s_i in range(0, u.size(0), 16384):
-            u_chunk = u[s_i : s_i + 16384]
-            inv_rms = torch.rsqrt(u_chunk.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(u.dtype)
-            u_chunk.mul_(inv_rms)
+        inv_rms = torch.rsqrt(u.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        u.mul_(inv_rms)
 
     def _init_or_mmap_expert_pages(
         self, file_path: Optional[str], num_experts: int, mode: BKPMountMode
@@ -427,9 +430,9 @@ class BKPPackage(nn.Module):
         if self._expert_pages_dev is None and self._gpu_resident_pages:
             self._expert_pages_dev = self.expert_pages_int8.to(device=dev, copy=True)
         if self._master_uv_fp32 is None or self._master_uv_fp32.numel() != n_slot * 2 * D_BKP:
-            self._sparse_steps_cpu = torch.zeros(0, dtype=torch.int32, device=buf_dev)
-            self._sparse_m1_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
-            self._sparse_m2_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
+            self._sparse_steps_cpu = torch.zeros(n_slot, dtype=torch.int32, device=buf_dev)
+            self._sparse_m1_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+            self._sparse_m2_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
             self._grad_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=dev)
             self._mmap_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=buf_dev)
             self._master_uv_fp32 = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
@@ -819,29 +822,37 @@ class BKPPackage(nn.Module):
         dev = self.u_codebook.device
         is_rw = self.mount_mode in (BKPMountMode.RW_SHARED, BKPMountMode.COW_PRIVATE)
         n_slot = self.num_experts if is_rw else 0
-        self._gpu_resident_pages = bool(is_rw and dev.type == "cuda" and self.grid_k <= 64)
-        self._gpu_resident_train = False
-        buf_dev = torch.device("cpu")
+        self._gpu_resident_pages = bool(is_rw and dev.type == "cuda" and self.grid_k <= 256)
+        self._gpu_resident_train = bool(is_rw and dev.type == "cuda" and self.grid_k <= 256)
+        buf_dev = dev if self._gpu_resident_train else torch.device("cpu")
         grad_dtype = torch.float32
 
         # 先释放旧的大张量引用，避免新旧缓冲同时驻留
         self._expert_pages_dev = None
         self._master_uv_fp32 = None
 
-        # 保持零优化器动量占用 (0 Bytes)，仅重置脏页掩码
-        self._sparse_steps_cpu = torch.zeros(0, dtype=torch.int32, device=buf_dev)
-        self._sparse_m1_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
-        self._sparse_m2_cpu = torch.zeros(0, dtype=torch.bfloat16, device=buf_dev)
-        self._grad_acc_cpu = torch.zeros(0, dtype=torch.float32, device=buf_dev)
-        self._grad_hit_counts = torch.zeros(0, dtype=torch.float32, device=buf_dev)
-        self._grad_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=dev)
-        self._mmap_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=buf_dev)
+        if self._sparse_steps_cpu.numel() != n_slot or self._sparse_steps_cpu.device != buf_dev:
+            self._sparse_steps_cpu = torch.zeros(0, dtype=torch.int32)
+            self._sparse_m1_cpu = torch.zeros(0, dtype=torch.bfloat16)
+            self._sparse_m2_cpu = torch.zeros(0, dtype=torch.bfloat16)
+            self._grad_acc_cpu = torch.zeros(0, dtype=torch.float32)
+            self._sparse_steps_cpu = torch.zeros(n_slot, dtype=torch.int32, device=buf_dev)
+            self._sparse_m1_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+            self._sparse_m2_cpu = torch.zeros((n_slot, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
+            self._grad_hit_counts = torch.zeros(0, dtype=torch.float32, device=buf_dev)
+            self._grad_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=dev)
+            self._mmap_dirty_mask = torch.zeros(n_slot, dtype=torch.bool, device=buf_dev)
 
         self._expert_pages_dev = (
             self.expert_pages_int8.to(device=dev, copy=True) if self._gpu_resident_pages else None
         )
-        self._master_uv_fp32 = None
+        master_dtype = torch.bfloat16
+        self._master_uv_fp32 = (
+            torch.zeros((n_slot, 2, D_BKP), dtype=master_dtype, device=buf_dev) if is_rw else None
+        )
         self._sparse_128_triblock_mode = None
+        if self._master_uv_fp32 is not None:
+            self._init_master_from_pages()
 
     @torch.no_grad()
     def _copy_manifold_stats_from(self, src: "BKPPackage") -> None:
@@ -995,6 +1006,15 @@ class BKPPackage(nn.Module):
         row_peak_sv = (sv_cpu * mature_cpu.float()).max(dim=1).values
         col_peak_sv = (sv_cpu * mature_cpu.float()).max(dim=0).values
         cand_priority = torch.sqrt((row_peak_sv[r_idx_all] * col_peak_sv[c_idx_all]).clamp(min=1e-12))
+        stream_ptr = getattr(self, "stream_next_ptr", None)
+        if stream_ptr is not None:
+            sp_cpu = stream_ptr.detach().cpu()
+            src_e, slot_j = torch.nonzero(sp_cpu >= 0, as_tuple=True)
+            if src_e.numel() > 0:
+                dst_e = sp_cpu[src_e, slot_j].long()
+                s_mask = torch.zeros((k, k), dtype=torch.float32)
+                s_mask[src_e // k, dst_e % k] = 100.0
+                cand_priority = cand_priority * (1.0 + s_mask[r_idx_all, c_idx_all])
         if cand_rc.shape[0] > max_crystallize_slots:
             _, top_ord = torch.topk(cand_priority, k=int(max_crystallize_slots), largest=True)
             r_sel = r_idx_all[top_ord]
@@ -1260,29 +1280,11 @@ class BKPPackage(nn.Module):
             inact_r_idx = torch.nonzero(c_mat.sum(dim=1) <= 0, as_tuple=False).squeeze(-1)
             inact_c_idx = torch.nonzero(c_mat.sum(dim=0) <= 0, as_tuple=False).squeeze(-1)
 
-            # 流线轨迹诱导二分图亲和矩阵 (Streamline-Induced Bipartite Affinity):
-            # 若为携带一阶因果流线表 stream_next_ptr 的 PMCPackage，流线转移边 (r1, c1) -> (r2, c2)
-            # 在二分图上天然诱导同轨迹交叉亲和项 (r1, c2) 与 (r2, c1)，使同一真实文档轨迹的微专家自动凝聚为连通谱簇！
-            aff_mat = c_mat.clone()
-            stream_ptr = getattr(self, "stream_next_ptr", None)
-            if stream_ptr is not None and isinstance(stream_ptr, torch.Tensor):
-                src_eids, slot_j = torch.where(stream_ptr >= 0)
-                if src_eids.numel() > 0:
-                    dst_eids = stream_ptr[src_eids, slot_j].long()
-                    r1 = torch.div(src_eids, k, rounding_mode="floor")
-                    c1 = src_eids % k
-                    r2 = torch.div(dst_eids, k, rounding_mode="floor")
-                    c2 = dst_eids % k
-                    w_edge = torch.minimum(c_mat[r1, c1], c_mat[r2, c2]).clamp(min=1.0)
-                    aff_mat.index_put_((r1, c2), w_edge, accumulate=True)
-                    aff_mat.index_put_((r2, c1), w_edge, accumulate=True)
-
             c_sub = c_mat[act_r_idx][:, act_c_idx]
-            aff_sub = aff_mat[act_r_idx][:, act_c_idx]
-            deg_r = aff_sub.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            deg_c = aff_sub.sum(dim=0, keepdim=True).clamp(min=1e-6)
+            deg_r = c_sub.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            deg_c = c_sub.sum(dim=0, keepdim=True).clamp(min=1e-6)
             d_r, d_c = deg_r.rsqrt(), deg_c.rsqrt()
-            norm_c = d_r * aff_sub * d_c
+            norm_c = d_r * c_sub * d_c
 
             p_r = F.normalize(deg_r.sqrt(), p=2, dim=0)
             p_c = F.normalize(deg_c.sqrt(), p=2, dim=1).transpose(0, 1)
@@ -1291,32 +1293,25 @@ class BKPPackage(nn.Module):
             scalar_rc = p_r.transpose(0, 1) @ proj_c
             norm_c_perp = norm_c - (proj_c @ p_c.transpose(0, 1)) - (p_r @ proj_r) + scalar_rc * (p_r @ p_c.transpose(0, 1))
 
-            u_svd_cpu, _, v_svd_t_cpu = torch.linalg.svd(norm_c_perp.cpu(), full_matrices=False)
-            u_svd = u_svd_cpu.to(norm_c_perp.device)
-            v_svd_t = v_svd_t_cpu.to(norm_c_perp.device)
+            u_svd, _, v_svd_t = torch.linalg.svd(norm_c_perp, full_matrices=False)
             f_r = d_r.squeeze(1) * u_svd[:, 0]
             f_c = d_c.squeeze(0) * v_svd_t[0, :]
             sub_r_perm = torch.argsort(f_r)
             sub_c_perm = torch.argsort(f_c)
 
             c_cand = c_sub[sub_r_perm][:, sub_c_perm]
-            aff_cand = aff_sub[sub_r_perm][:, sub_c_perm]
             mid_r, mid_c = r_act_n // 2, c_act_n // 2
-            if (aff_cand[:mid_r, mid_c:].sum() + aff_cand[mid_r:, :mid_c].sum()) > (
-                aff_cand[:mid_r, :mid_c].sum() + aff_cand[mid_r:, mid_c:].sum()
+            if (c_cand[:mid_r, mid_c:].sum() + c_cand[mid_r:, :mid_c].sum()) > (
+                c_cand[:mid_r, :mid_c].sum() + c_cand[mid_r:, mid_c:].sum()
             ):
                 sub_c_perm = sub_c_perm.flip(0)
                 f_c = -f_c
                 c_cand = c_sub[sub_r_perm][:, sub_c_perm]
-                aff_cand = aff_sub[sub_r_perm][:, sub_c_perm]
 
             # 非对称谱双聚类切分 (Asymmetric Cheeger / Conductance Minimum Sweep):
             # 在剥离空白死区后的活跃子图 (r_act_n x c_act_n) 上扫描真实非对称切分点 (sr, sc)
-            total_aff = float(aff_cand.sum().item())
             prefix = torch.zeros((r_act_n + 1, c_act_n + 1), dtype=torch.float32, device=c_mat.device)
-            prefix[1:, 1:] = aff_cand.cumsum(dim=0).cumsum(dim=1)
-            prefix_c = torch.zeros((r_act_n + 1, c_act_n + 1), dtype=torch.float32, device=c_mat.device)
-            prefix_c[1:, 1:] = c_cand.cumsum(dim=0).cumsum(dim=1)
+            prefix[1:, 1:] = c_cand.cumsum(dim=0).cumsum(dim=1)
             min_r_m = max(2, r_act_n // (2 * BKP_NUM_HEADS))
             min_c_m = max(2, c_act_n // (2 * BKP_NUM_HEADS))
             min_cluster_act = (1.0 / float(STANDARD_GRID_SIZES[0])) * total_act
@@ -1339,18 +1334,14 @@ class BKPPackage(nn.Module):
             best_sr, best_sc = r_act_n // 2, c_act_n // 2
             for sr in r_cands:
                 for sc in c_cands:
-                    act_aa_c = float(prefix_c[sr, sc].item())
-                    act_bb_c = float((prefix_c[r_act_n, c_act_n] - prefix_c[sr, c_act_n] - prefix_c[r_act_n, sc] + prefix_c[sr, sc]).item())
-                    if act_aa_c < min_cluster_act or act_bb_c < min_cluster_act:
+                    act_aa = float(prefix[sr, sc].item())
+                    act_bb = float((prefix[r_act_n, c_act_n] - prefix[sr, c_act_n] - prefix[r_act_n, sc] + prefix[sr, sc]).item())
+                    if act_aa < min_cluster_act or act_bb < min_cluster_act:
                         continue
-                    aff_aa = float(prefix[sr, sc].item())
-                    aff_bb = float((prefix[r_act_n, c_act_n] - prefix[sr, c_act_n] - prefix[r_act_n, sc] + prefix[sr, sc]).item())
-                    if aff_aa <= 0.0 or aff_bb <= 0.0:
-                        continue
-                    cross_aff = max(0.0, total_aff - (aff_aa + aff_bb))
-                    cross_c = max(0.0, float(total_act - (act_aa_c + act_bb_c)))
-                    cr_cur = cross_c / total_act
-                    ncut = cross_aff * (1.0 / aff_aa + 1.0 / aff_bb)
+                    diag_cur = act_aa + act_bb
+                    cross_cur = max(0.0, float(total_act - diag_cur))
+                    cr_cur = cross_cur / total_act
+                    ncut = cross_cur * (1.0 / act_aa + 1.0 / act_bb)
                     if ncut < best_score:
                         best_score = ncut
                         best_cross_ratio = cr_cur
@@ -1545,15 +1536,16 @@ class BKPPackage(nn.Module):
         c_anchor_p = torch.stack(
             [u_cb_norm[:, r_p, :].permute(1, 0, 2).float(), v_cb_norm[:, c_p, :].permute(1, 0, 2).float()], dim=2
         ).reshape(-1, D_BKP) * math.sqrt(float(BKP_SUBKEY_DIM))
+        c_anchor_ch = torch.stack(
+            [u_cb_norm[:, r_p, :].permute(1, 0, 2).float(), v_cb_norm[:, c_ch, :].permute(1, 0, 2).float()], dim=2
+        ).reshape(-1, D_BKP) * math.sqrt(float(BKP_SUBKEY_DIM))
 
         alpha_p = (u_parent * c_anchor_p).sum(dim=-1, keepdim=True) / float(D_BKP)
         u_perp = u_parent - alpha_p * c_anchor_p
         u_perp_unit = F.normalize(u_perp, dim=-1) * (JET_TANGENT_NORM_STAR * math.sqrt(float(D_BKP)))
 
         u_parent_new = F.normalize(JET_NORMAL_ALPHA_STAR * c_anchor_p + u_perp_unit, dim=-1) * math.sqrt(float(D_BKP))
-        u_child_new = F.normalize(JET_NORMAL_ALPHA_STAR * c_anchor_p - u_perp_unit, dim=-1) * math.sqrt(float(D_BKP))
-        q2_child = F.normalize(u_child_new.view(-1, BKP_NUM_HEADS, 2, 128)[:, :, 1, :], dim=-1)
-        self.v_codebook.data[:, c_ch, :] = q2_child.permute(1, 0, 2).to(dtype=self.v_codebook.dtype)
+        u_child_new = F.normalize(JET_NORMAL_ALPHA_STAR * c_anchor_ch - u_perp_unit, dim=-1) * math.sqrt(float(D_BKP))
 
         v_p_unit = F.normalize(v_parent, dim=-1)
         v_odd_dir = F.normalize(u_perp_unit - (u_perp_unit * v_p_unit).sum(dim=-1, keepdim=True) * v_p_unit, dim=-1)
@@ -2262,10 +2254,10 @@ class BKPManager(nn.Module):
         vc_mat = mature_2d.any(dim=0)
         base_64_mask = torch.zeros(k_p, dtype=torch.bool, device=q1.device)
         base_64_mask[: min(64, k_p)] = True
-        # 当成熟行/列 >= 64 时严格锚定成熟行/列；当成熟行/列不足 64 时并入前 64 个基础正交子键，
-        # 既防止少量激活行上的峰值信号自污染背景方差，又保证 64->128 四象限扩容瞬间背景 mu/std/tau_z 100% 不变 (扩容零误差 = 0.0000)！
-        valid_r = torch.where(vr_mat.sum() >= 64, vr_mat, base_64_mask | vr_mat)
-        valid_c = torch.where(vc_mat.sum() >= 64, vc_mat, base_64_mask | vc_mat)
+        # 当成熟行/列 >= 8 时严格锚定成熟行/列；当刚写入少量微专家 (< 8) 时锚定前 64 个基础正交子键，
+        # 既避免 1~2 行自减均值归零，又保证 64->128 四象限扩容瞬间背景 mu/std/tau_z 100% 不变 (扩容零误差 = 0.0000)！
+        valid_r = torch.where(vr_mat.sum() >= 8, vr_mat, base_64_mask | vr_mat)
+        valid_c = torch.where(vc_mat.sum() >= 8, vc_mat, base_64_mask | vc_mat)
         return s1, s2, valid_r, valid_c
 
     def _route_tile_block(
@@ -2639,8 +2631,8 @@ class BKPManager(nn.Module):
                 vc_mat = mature_2d.any(dim=0)
                 base_64_p = torch.zeros(k_p, dtype=torch.bool, device=q1.device)
                 base_64_p[: min(64, k_p)] = True
-                vr_p = torch.where(vr_mat.sum() >= 64, vr_mat, base_64_p | vr_mat)
-                vc_p = torch.where(vc_mat.sum() >= 64, vc_mat, base_64_p | vc_mat)
+                vr_p = torch.where(vr_mat.sum() >= 8, vr_mat, base_64_p | vr_mat)
+                vc_p = torch.where(vc_mat.sum() >= 8, vc_mat, base_64_p | vc_mat)
                 precomputed_list.append((p, s1_p, s2_p, vr_p, vc_p))
                 if not p.is_bridge_pkg:
                     valid_s1_chunks.append((s1_p, vr_p))
@@ -2841,15 +2833,13 @@ class BKPManager(nn.Module):
                         co_mat = torch.matmul(tok_pkg_mat.t(), tok_pkg_mat).cpu().tolist()
                         pids_now = [pkg.pkg_id for _, pkg, _, _ in pkg_routing_results]
                         for i_a, pa in enumerate(pids_now):
-                            hits_a = float(co_mat[i_a][i_a])
-                            self.pkg_token_hit_counts[pa] = self.pkg_token_hit_counts.get(pa, 0.0) + hits_a
+                            self.pkg_token_hit_counts[pa] = self.pkg_token_hit_counts.get(pa, 0.0) + float(co_mat[i_a][i_a])
                             for i_b in range(i_a + 1, len(pids_now)):
                                 pb = pids_now[i_b]
-                                hits_b = float(co_mat[i_b][i_b])
-                                co_ab = max(float(co_mat[i_a][i_b]), min(hits_a, hits_b))
                                 pair_key = (pa, pb) if pa < pb else (pb, pa)
+                                co_val = max(float(co_mat[i_a][i_b]), min(float(co_mat[i_a][i_a]), float(co_mat[i_b][i_b])))
                                 self.pkg_coactivation_counts[pair_key] = (
-                                    self.pkg_coactivation_counts.get(pair_key, 0.0) + co_ab
+                                    self.pkg_coactivation_counts.get(pair_key, 0.0) + co_val
                                 )
 
         # 定律 3: 零点锚定 Softmax_1 + 严格 L2 能量守恒路由权重 (L2 Energy-Conserving Partition of Unity):
@@ -3083,10 +3073,6 @@ class BKPManager(nn.Module):
 
             num_u = unique_eids_dev.numel()
             buf_dev = pkg._sparse_m1_cpu.device
-            if pkg._sparse_m1_cpu.numel() != pkg.num_experts * 2 * D_BKP:
-                pkg._sparse_steps_cpu = torch.zeros(pkg.num_experts, dtype=torch.int32, device=buf_dev)
-                pkg._sparse_m1_cpu = torch.zeros((pkg.num_experts, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
-                pkg._sparse_m2_cpu = torch.zeros((pkg.num_experts, 2, D_BKP), dtype=torch.bfloat16, device=buf_dev)
             has_master = pkg._master_uv_fp32 is not None and pkg._master_uv_fp32.numel() > 0
             need_cpu_ids = (buf_dev.type == "cpu") or (
                 has_master and pkg._master_uv_fp32.device.type == "cpu"
