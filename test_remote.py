@@ -703,31 +703,6 @@ def test_penrose_five_dimensional_complexity_scaling() -> Dict[str, Any]:
     return res
 
 
-if __name__ == "__main__":
-    import gc
-    import os
-    from train_penrose_v1 import run_penrose_v1_training
-
-    def _gc():
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace", "experiment_log", "penrose_v1_genesis_verification")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "report.json")
-    full_report: Dict[str, Any] = {
-        "device": str(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
-    }
-
-    def _save_step(key: str, fn):
-        full_report[key] = fn()
-        _gc()
-        tmp_path = out_path + ".tmp"
-        with open(tmp_path, "w", encoding="ascii", errors="backslashreplace") as f:
-            json.dump(full_report, f, ensure_ascii=True, indent=2)
-        os.replace(tmp_path, out_path)
-
     _save_step("exp1_holographic_wavepacket_8x256", test_holographic_wavepacket_lossless_roundtrip)
     _save_step("exp2_two_tier_negative_divergence_funnel", test_two_tier_negative_divergence_funnel_segmentation)
     _save_step("exp3_mpu_five_module_and_tri_state_bus", test_mpu_five_module_pipeline_and_tri_state_bus)
@@ -738,6 +713,7 @@ if __name__ == "__main__":
     _save_step("exp8_five_dimensional_complexity_scaling", test_penrose_five_dimensional_complexity_scaling)
     _save_step("end_to_end_training_15steps", lambda: run_penrose_v1_training(steps=15))
     print(f"\n[ALL 8 PENROSE v1.0 CONTRACTS + 15-STEP TRAINING COMPLETED] 报告已保存至: {out_path}")
+
 
 
 

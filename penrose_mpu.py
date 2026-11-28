@@ -243,7 +243,7 @@ class MPUModule3WaistCoupler(nn.Module):
                 active_weights=zero_s.unsqueeze(-1),
                 max_resonance=zero_s,
             )
-            return psi_6, zero_d, diag
+            return psi_6, zero_d, diag, q_waist_2048
 
         diag = pmc_manager.query_with_helmholtz_diagnostics(
             q_waist_2048,
@@ -254,7 +254,7 @@ class MPUModule3WaistCoupler(nn.Module):
         z_rms = delta_model * torch.rsqrt(delta_model.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(psi_6.dtype)
         # 单位残差门控（Unit Residual Gating，保证 Delta_PMC=0 时恒等直通）
         psi_6_coupled = psi_6 * (1.0 + torch.tanh(self.w_delta(z_rms)))
-        return psi_6_coupled, delta_model, diag
+        return psi_6_coupled, delta_model, diag, q_waist_2048
 
 
 class MPUModule5GeodesicEgress(nn.Module):
@@ -306,6 +306,7 @@ class MPUStepOutput:
     delta_q_perp: torch.Tensor
     helmholtz_diag: HelmholtzFieldDiagnostics
     loss: Optional[torch.Tensor] = None
+    q_waist: Optional[torch.Tensor] = None
 
 
 class PenroseMPU(nn.Module):
@@ -435,7 +436,7 @@ class PenroseMPU(nn.Module):
             )
 
         # 3. Module 3: 腰部 PMC 流形场耦合门 (Waist Manifold Coupler)
-        h_coupled, z_highway, diag = self.module3_waist_coupler(
+        h_coupled, z_highway, diag, q_waist_2048 = self.module3_waist_coupler(
             h,
             psi_0_anchor=psi_0,
             pmc_manager=pmc_manager,
@@ -475,6 +476,7 @@ class PenroseMPU(nn.Module):
             delta_q_perp=delta_q_perp,
             helmholtz_diag=diag,
             loss=loss,
+            q_waist=q_waist_2048,
         )
 
 

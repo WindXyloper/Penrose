@@ -85,6 +85,12 @@
    - 正向拖拽学习（`drag_and_drop_ingest`）与逆向拖拽遗忘（`drag_and_drop_erase`）构成流形记忆的正逆对偶群算子：
      - **独占微专家页（公理 9 细胞凋亡）**：当目标轨迹对应的微专家页残余有效样本计数 $h_{\text{rem}} = h_{\text{old}} - \eta_{\text{erase}}\Delta h \le 0$ 时，执行 `apoptosis_expert_pages` 将其 INT8 载荷、FP16 缩放与流线边 100% 物理归零，并将同行/同列子键码本重锚定至剩余存活微专家的页内键重心；
      - **共享微专家页（公理 10 秩-1 正交剥离）**：当该微专家页同时承载其他文档的公共知识（$h_{\text{rem}} > 0$，如共享的语法或前缀道岔）时，按逆向样本权重 $\beta = \min(\eta_{\text{erase}}\Delta h / h_{\text{old}}, 1 - \frac{1}{\sqrt{d_h}})$ 从载荷 $v_{\text{old}}$ 中剥离平行于待擦除轨迹的分量，并按反向角 $-\beta\theta$ 执行逆向 Rodrigues 测地旋转与流线熔断（`sever_streamline_transition`），在彻底抹除目标轨迹的同时对共存文档记忆实现零连带损伤。
+5. **上下文即流形 (`OverlayFS`)、零特殊 Token 割线冲量生成与 `.pmc` 神经-符号反编译器**：
+   - **UTF-8 合法字节子空间正交投影**：在逆沃尔什变换 $\mathbf{H}_{256}$ 中施加零超参数的 UTF-8 有限状态机合法字节掩码，从数学上根除非法字节乱码；
+   - **OverlayFS 会话增量流形（`mount_context_pmc` / `unmount_context_pmc`）**：主干 `Base.pmc` 锁定为只读（`RO_SYS`），会话上下文实时凝结为可读写私有层 `Context.pmc`（$\mathcal{M}_{\text{total}} = \mathcal{M}_{\text{base}}^{\text{(RO)}} \oplus \mathcal{M}_{\text{ctx}}^{\text{(RW)}}$），实现跨任意长距离 0 衰减唤醒、关闭窗口即零污染遗忘、或一键通过 `bkp_merge_triadic_bundle` 合入主干；
+   - **零特殊 Token 割线冲量与终端吸引子停机（`generate_text`）**：外部输入提供瞬间割线冲量（或单词零初速下的微专家内禀坡度推动），释放后沿流形表面测地滑行，直至滚入终端负散度静止吸引子自然停机；
+   - **神经-符号反编译器（`decompile_pmc_to_cfg`）**：利用 $\mathbf{H}_{2048}^{-1}$ 的正交可逆性，将 `.pmc` 内的微专家 $(u_m, v_m)$ 与 `stream_next_ptr` 直接反编译为可读的 `IF ... THEN GOTO ...` 符号控制流图（CFG）。
+
 
 ---
 

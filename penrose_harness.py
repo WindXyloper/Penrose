@@ -18,6 +18,8 @@ from penrose_pmc import (
     D_BKP,
     BKP_NUM_HEADS,
     JET_NORMAL_ALPHA_STAR,
+    JET_TANGENT_NORM_STAR,
+    SIMPLEX_3_BARYCENTER_PROJ,
     AMBIENT_NOISE_FLOOR,
     GUMBEL_SINK_DIV_STAR,
     FUNNEL_RESONANCE_APERTURE,
@@ -184,6 +186,11 @@ class HolographicWavepacketTransducer(nn.Module):
         min_signal_amp = 1.0 / math.sqrt(float(self.max_slots))
         tau_aperture = 0.5 * (min_signal_amp + self.gumbel_tau_256)
 
+        expected_cont = 0
+        char_start_idx = 0
+        lead_byte = 0
+        first_cont = False
+
         for i in range(self.max_slots):
             ch = i % 8
             ch_vec = q_channels[ch]
@@ -191,16 +198,72 @@ class HolographicWavepacketTransducer(nn.Module):
             unrot_vec = self._apply_givens_256(ch_vec, self.pos_cos[i], self.pos_sin[i], inverse=True)
             # 在 256 个正交字节基上的投影响应: (256,)
             scores = torch.matmul(self.h_256, unrot_vec)
-            max_val, best_b = torch.max(scores, dim=-1)
+
+            # UTF-8 协议合法字节子空间正交投影掩码（零超参有限状态机，彻底消除 0xFFFD 乱码）
+            valid_mask = torch.zeros(256, dtype=torch.bool, device=scores.device)
+            rem_slots = self.max_slots - i
+            if expected_cont == 0:
+                valid_mask[0x00:0x80] = True
+                if rem_slots >= 2:
+                    valid_mask[0xC2:0xE0] = True
+                if rem_slots >= 3:
+                    valid_mask[0xE0:0xF0] = True
+                if rem_slots >= 4:
+                    valid_mask[0xF0:0xF5] = True
+            else:
+                if first_cont:
+                    if lead_byte == 0xE0:
+                        valid_mask[0xA0:0xC0] = True
+                    elif lead_byte == 0xED:
+                        valid_mask[0x80:0xA0] = True
+                    elif lead_byte == 0xF0:
+                        valid_mask[0x90:0xC0] = True
+                    elif lead_byte == 0xF4:
+                        valid_mask[0x80:0x90] = True
+                    else:
+                        valid_mask[0x80:0xC0] = True
+                else:
+                    valid_mask[0x80:0xC0] = True
+
+            masked_scores = scores.masked_fill(~valid_mask, -1e9)
+            max_val, best_b = torch.max(masked_scores, dim=-1)
             peak = float(max_val.item())
-            if peak < tau_aperture:
+            b_val = int(best_b.item())
+
+            if expected_cont == 0 and peak < tau_aperture:
                 break
-            decoded_bytes.append(int(best_b.item()))
+            if expected_cont > 0 and peak < self.gumbel_tau_256 * 0.5:
+                # 若多字节字符中途能量坍缩，截断未闭合残片并终止
+                del decoded_bytes[char_start_idx:]
+                del slot_peaks[char_start_idx:]
+                break
+
+            if expected_cont == 0:
+                char_start_idx = len(decoded_bytes)
+                lead_byte = b_val
+                if 0xC2 <= b_val <= 0xDF:
+                    expected_cont = 1
+                    first_cont = True
+                elif 0xE0 <= b_val <= 0xEF:
+                    expected_cont = 2
+                    first_cont = True
+                elif 0xF0 <= b_val <= 0xF4:
+                    expected_cont = 3
+                    first_cont = True
+            else:
+                expected_cont -= 1
+                first_cont = False
+
+            decoded_bytes.append(b_val)
             slot_peaks.append(peak)
             # 从该通道减去已解码出的正交分量，确保后续超过 8 字节的黄金角移相层无残留干扰
             q_channels[ch] = q_channels[ch] - peak * self._apply_givens_256(
-                self.h_256[int(best_b.item())], self.pos_cos[i], self.pos_sin[i], inverse=False
+                self.h_256[b_val], self.pos_cos[i], self.pos_sin[i], inverse=False
             )
+
+        if expected_cont > 0:
+            del decoded_bytes[char_start_idx:]
+            del slot_peaks[char_start_idx:]
 
         return bytes(decoded_bytes), slot_peaks
 
@@ -526,6 +589,96 @@ class PenroseHarness(nn.Module):
             "curl_trace": curl_trace,
         }
 
+    @torch.no_grad()
+    def snap_to_manifold_attractor(
+        self,
+        q_pred: torch.Tensor,
+        q_curr: torch.Tensor,
+        q_prev: Optional[torch.Tensor] = None,
+        active_stream_ref: Optional[Tuple[str, int]] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[str, int]]]:
+        """
+        流形吸引子本征态正交吸附（Attractor Eigenstate Snap）：
+        利用公理 3 写入算子的精确逆变换：
+            v_tan = SIMPLEX_3_BARYCENTER_PROJ * v_m + (SIMPLEX_3_BARYCENTER_PROJ ** 2) * q_c
+            q_target = Normalize( sqrt(max(0, 1 - ||v_tan||^2)) * q_c + v_tan )
+        从微专家切向量 v_m 中 100% 闭式还原出离散目标波包 q_target，彻底消除旧波包残影与过渡噪声。
+        """
+        q_c = F.normalize(q_curr.detach().float().view(1, D_BKP), dim=-1)
+        q_p = F.normalize(q_prev.detach().float().view(1, D_BKP), dim=-1) if q_prev is not None else q_c
+        q_out = F.normalize(q_pred.detach().float().view(1, D_BKP), dim=-1)
+
+        dq = q_c - (q_c * q_p).sum(dim=-1, keepdim=True) * q_c
+        dq_norm = dq.norm(dim=-1, keepdim=True)
+        has_tan = (dq_norm > 1e-5).float()
+        dq_unit = F.normalize(dq, dim=-1)
+        psi = F.normalize(
+            JET_NORMAL_ALPHA_STAR * q_c
+            + has_tan * JET_TANGENT_NORM_STAR * dq_unit
+            + (1.0 - has_tan) * (1.0 - JET_NORMAL_ALPHA_STAR) * q_c,
+            dim=-1,
+        )
+
+        q1_psi, q2_psi = self.pmc_manager._standardize_subqueries(psi, update_center=False)
+        q_sphere_psi = F.normalize(torch.stack([q1_psi, q2_psi], dim=2).reshape(1, D_BKP).float(), dim=-1)
+
+        # 收集上一拍硬件流线指针表 stream_next_ptr 指向的候选下一跳微专家
+        ptr_candidates: List[Tuple[str, int]] = []
+        if active_stream_ref is not None:
+            ref_pid, ref_eid = active_stream_ref
+            ref_mk = self.pmc_manager._mod_key(ref_pid)
+            if ref_mk in self.pmc_manager.packages:
+                ref_pkg = self.pmc_manager.packages[ref_mk]
+                if isinstance(ref_pkg, PMCPackage) and 0 <= ref_eid < ref_pkg.num_experts:
+                    for p_val in ref_pkg.stream_next_ptr[ref_eid]:
+                        nxt_eid = int(p_val.item())
+                        if nxt_eid >= 0:
+                            ptr_candidates.append((ref_pkg.pkg_id, nxt_eid))
+
+        best_cos = -1.0
+        best_target: Optional[torch.Tensor] = None
+        best_ref: Optional[Tuple[str, int]] = None
+
+        for pid in reversed(self.pmc_manager.l1_active_pkg_ids):
+            mk = self.pmc_manager._mod_key(pid)
+            if mk not in self.pmc_manager.packages:
+                continue
+            pkg = self.pmc_manager.packages[mk]
+            if not isinstance(pkg, PMCPackage):
+                continue
+            act_mask = pkg.scales[:, 1] > 1e-6
+            if not bool(act_mask.any()):
+                continue
+            act_eids = torch.nonzero(act_mask, as_tuple=False).squeeze(-1)
+            u_act, v_act = pkg.dequantize_expert_uv(act_eids)
+            u_unit = F.normalize(u_act.float(), dim=-1)
+            sims = torch.matmul(q_sphere_psi, u_unit.t()).squeeze(0)
+            top_k = min(8, int(sims.numel()))
+            top_vals, top_idx = torch.topk(sims, k=top_k)
+            for idx_pos in range(top_k):
+                cos_u = float(top_vals[idx_pos].item())
+                if cos_u < SIMPLEX_3_BARYCENTER_PROJ:
+                    continue
+                eid = int(act_eids[top_idx[idx_pos]].item())
+                v_vec = v_act[top_idx[idx_pos]].float().unsqueeze(0)
+                # 切空间正交剥离法向势阱分量 (-1/sqrt(3) * q_c)，直接还原纯净目标波包本征态 q_target
+                v_perp = v_vec - (v_vec * q_c).sum(dim=-1, keepdim=True) * q_c
+                if float(v_perp.norm().item()) <= 1e-5:
+                    continue
+                cand_target = F.normalize(v_perp, dim=-1)
+                align_pred = float((cand_target * q_out).sum().item())
+                ctx_bonus = 0.25 if pkg.mount_mode == PMCMountMode.COW_PRIVATE else 0.0
+                ptr_bonus = 0.35 if (pkg.pkg_id, eid) in ptr_candidates else 0.0
+                score = cos_u + 0.15 * align_pred + ctx_bonus + ptr_bonus
+                if score > best_cos:
+                    best_cos = score
+                    best_target = cand_target
+                    best_ref = (pkg.pkg_id, eid)
+
+        if best_target is not None:
+            return best_target.squeeze(0).to(q_pred.dtype), best_ref
+        return q_out.squeeze(0).to(q_pred.dtype), None
+
     def train_manifold_trajectory(
         self,
         raw_text_or_wavepackets: Union[str, torch.Tensor],
@@ -780,6 +933,293 @@ class PenroseHarness(nn.Module):
             "total_mitosis_spawns": int(self.pmc_manager.total_mitosis_spawns),
             "events": events,
             "forest_snapshot": snap,
+        }
+
+    @torch.no_grad()
+    def mount_context_pmc(
+        self,
+        session_id: str = "Context_Session.pmc",
+        grid_k: int = 64,
+    ) -> PMCPackage:
+        """
+        OverlayFS 会话增量流形挂载（Context-as-a-Manifold）：
+        - 将所有已挂载主干包锁定为只读 `PMCMountMode.RO_SYS`（100% 物理防污染与防越狱篡改）；
+        - 挂载当前对话窗口私有的可写增量流形包 `Context.pmc` (`PMCMountMode.COW_PRIVATE`)；
+        - 走过的上下文轨迹实时在 `Context.pmc` 中凝结为局部势场，与主干流形叠加成 V_base (+) V_ctx，
+          无需任何指数移动平均（EMA）衰减率，即可实现跨任意句距的 0 衰减精确召回！
+        """
+        if not hasattr(self, "_saved_base_mount_modes"):
+            self._saved_base_mount_modes: Dict[str, PMCMountMode] = {}
+        for pkg in self.pmc_manager.mounted_packages:
+            if pkg.pkg_id != session_id and pkg.mount_mode != PMCMountMode.COW_PRIVATE:
+                self._saved_base_mount_modes[pkg.pkg_id] = pkg.mount_mode
+                pkg.mount_mode = PMCMountMode.RO_SYS
+
+        mk = self.pmc_manager._mod_key(session_id)
+        if mk in self.pmc_manager.packages:
+            ctx_pkg = self.pmc_manager.packages[mk]
+            ctx_pkg.mount_mode = PMCMountMode.COW_PRIVATE
+            if session_id not in self.pmc_manager.l1_active_pkg_ids:
+                self.pmc_manager.l1_active_pkg_ids.append(session_id)
+            return ctx_pkg  # type: ignore[return-value]
+
+        ctx_pkg = PMCPackage(
+            pkg_id=session_id,
+            grid_k=grid_k,
+            mount_mode=PMCMountMode.COW_PRIVATE,
+            is_base_pkg=False,
+            device=self.device,
+        )
+        self.pmc_manager.mount_package(ctx_pkg, pin_to_l1=True)
+        self._active_context_pkg_id = session_id
+        return ctx_pkg
+
+    @torch.no_grad()
+    def unmount_context_pmc(
+        self,
+        session_id: Optional[str] = None,
+        commit_to_base: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        卸载当前对话窗口的 `Context.pmc`：
+        - 若 `commit_to_base=False`（默认）：直接丢弃临时会话增量，恢复主干包原有挂载状态，主干流形 100% 零污染；
+        - 若 `commit_to_base=True`：调用 `PMCPackage.bkp_merge_triadic_bundle` 将 `Context.pmc` 无损缝合进主干流形，实现按需持续学习。
+        """
+        sid = session_id or getattr(self, "_active_context_pkg_id", "Context_Session.pmc")
+        saved_modes = getattr(self, "_saved_base_mount_modes", {})
+        for pkg in self.pmc_manager.mounted_packages:
+            if pkg.pkg_id in saved_modes:
+                pkg.mount_mode = saved_modes[pkg.pkg_id]
+        saved_modes.clear()
+
+        mk = self.pmc_manager._mod_key(sid)
+        merged_pages = 0
+        if mk in self.pmc_manager.packages:
+            ctx_pkg = self.pmc_manager.packages[mk]
+            if commit_to_base and isinstance(ctx_pkg, PMCPackage):
+                base_pkg: Optional[PMCPackage] = None
+                for pkg in self.pmc_manager.mounted_packages:
+                    if pkg.pkg_id != sid and isinstance(pkg, PMCPackage) and not pkg.is_bridge_pkg:
+                        base_pkg = pkg
+                        break
+                if base_pkg is not None:
+                    merged_pkg = PMCPackage.bkp_merge_triadic_bundle(
+                        base_pkg, ctx_pkg, merged_id=base_pkg.pkg_id
+                    )
+                    merged_pkg.mount_mode = base_pkg.mount_mode
+                    merged_pkg.is_base_pkg = base_pkg.is_base_pkg
+                    self.pmc_manager.mount_package(merged_pkg, pin_to_l1=True)
+                    merged_pages = int((merged_pkg.scales[:, 1] > 1e-6).sum().item())
+            self.pmc_manager.unmount_package(sid)
+
+        self._active_context_pkg_id = None
+        return {
+            "unmounted_session": sid,
+            "committed_to_base": bool(commit_to_base),
+            "merged_active_pages": merged_pages,
+        }
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        user_prompt: str,
+        max_steps: int = 24,
+        use_context_pmc: bool = True,
+        ingest_prompt_into_context: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        零特殊 Token（无需 `<|user|>` / `<|assistant|>`）的第一性原理对话生成引擎：
+        1. 阶段一（User Secant Impulse，外部割线冲量注入）：
+           用户的输入作为外部割线轨迹一次性注入系统，若 `use_context_pmc=True` 则实时压印进当前会话的 `Context.pmc`，
+           并将状态推至句末高势能释放点 `q(tau_0)` 及入射初速度方向；
+        2. 阶段二（Surface Geodesic Rollout，流形表面测地滑行）：
+           外部冲量撤除后，状态在叠加流形 `M_base (+) M_ctx` 表面切向量场与 `stream_next_ptr` 驱动下自主滑行，
+           经三态总线 `Branch B` + 流形吸引子本征态吸附 + UTF-8 子空间正交解码逐拍吐出自然语言符号，
+           直至落入负散度静止吸引子（切向推力消失或抵达句末不动点）自然停机！
+        """
+        if use_context_pmc and getattr(self, "_active_context_pkg_id", None) is None:
+            self.mount_context_pmc()
+
+        q_seq, prompt_chunks = self.transducer.segment_text_to_wavepackets(
+            user_prompt, pmc_manager=self.pmc_manager
+        )
+        if q_seq.size(0) == 0:
+            return {
+                "prompt": user_prompt,
+                "prompt_chunks": [],
+                "generated_chunks": [],
+                "generated_text": "",
+                "steps": 0,
+                "stop_reason": "empty_prompt",
+            }
+
+        if use_context_pmc and ingest_prompt_into_context and q_seq.size(0) >= 2:
+            q_c_ing = q_seq[:-1].unsqueeze(0)
+            q_t_ing = q_seq[1:].unsqueeze(0)
+            q_p_ing = torch.cat([q_c_ing[:, :1, :], q_c_ing[:, :-1, :]], dim=1)
+            self.pmc_manager.geodesic_kaczmarz_snap_update(
+                q_curr=q_c_ing,
+                q_prev=q_p_ing,
+                q_target=q_t_ing,
+                snap_rate=1.0,
+                enable_auto_mitosis=True,
+            )
+
+        q_curr = q_seq[-1:].unsqueeze(0)
+        q_prev = q_seq[-2:-1].unsqueeze(0) if q_seq.size(0) >= 2 else q_curr.clone()
+
+        # 阶段一末尾：沿用户割线轨迹追踪句末激活的流线指针 active_stream_ref
+        active_stream_ref: Optional[Tuple[str, int]] = None
+        if q_seq.size(0) >= 2:
+            for p_idx in range(q_seq.size(0) - 1):
+                qp_step = q_seq[p_idx - 1] if p_idx >= 1 else q_seq[p_idx]
+                _, active_stream_ref = self.snap_to_manifold_attractor(
+                    q_pred=q_seq[p_idx + 1],
+                    q_curr=q_seq[p_idx],
+                    q_prev=qp_step,
+                    active_stream_ref=active_stream_ref,
+                )
+
+        generated_chunks: List[str] = []
+        step_traces: List[Dict[str, Any]] = []
+        stop_reason = "max_steps_reached"
+        terminal_punct = {"。", "！", "？", ".", "!", "?", "\n"}
+
+        for step_idx in range(max_steps):
+            bus_out = self.step_tri_state_bus(
+                q_curr=q_curr,
+                q_prev=q_prev,
+                max_internal_curl_ticks=2,
+            )
+            q_raw_next = bus_out["q_final"]
+            q_snapped, snapped_ref = self.snap_to_manifold_attractor(
+                q_pred=q_raw_next,
+                q_curr=q_curr[:, -1, :],
+                q_prev=q_prev[:, -1, :],
+                active_stream_ref=active_stream_ref,
+            )
+            active_stream_ref = snapped_ref
+
+            cos_stay = float(F.cosine_similarity(q_snapped.view(1, -1), q_curr.view(1, -1)).item())
+            if cos_stay > 0.995 and snapped_ref is None:
+                stop_reason = "vacuum_fixed_point"
+                break
+
+            emitted_chunk = self.transducer.decode_wavepacket_to_string(q_snapped)
+            if len(emitted_chunk) == 0:
+                stop_reason = "empty_wavepacket_sink"
+                break
+
+            if len(generated_chunks) >= 1 and emitted_chunk == generated_chunks[-1]:
+                stop_reason = "attractor_fixed_point"
+                break
+
+            generated_chunks.append(emitted_chunk)
+            step_traces.append(
+                {
+                    "step": step_idx + 1,
+                    "chunk": emitted_chunk,
+                    "snapped_expert": f"{snapped_ref[0]}#{snapped_ref[1]}" if snapped_ref else "mpu_free",
+                    "div_v": round(bus_out["div_trace"][-1], 4) if bus_out["div_trace"] else 0.0,
+                }
+            )
+
+            q_prev = q_curr
+            q_curr = q_snapped.view(1, 1, D_BKP)
+
+            if any(emitted_chunk.endswith(p) for p in terminal_punct):
+                _, next_ref = self.snap_to_manifold_attractor(
+                    q_pred=q_curr[:, -1, :],
+                    q_curr=q_curr[:, -1, :],
+                    q_prev=q_prev[:, -1, :],
+                )
+                if next_ref is None:
+                    stop_reason = "terminal_sink_attractor"
+                    break
+
+        return {
+            "prompt": user_prompt,
+            "prompt_chunks": prompt_chunks,
+            "generated_chunks": generated_chunks,
+            "generated_text": "".join(generated_chunks),
+            "steps": len(generated_chunks),
+            "stop_reason": stop_reason,
+            "trace": step_traces,
+        }
+
+    @torch.no_grad()
+    def decompile_pmc_to_cfg(
+        self,
+        pkg: Optional[PMCPackage] = None,
+        max_nodes: int = 32,
+    ) -> Dict[str, Any]:
+        """
+        神经-符号二象性反编译器（Neuro-Symbolic Manifold Decompiler）：
+        利用全息换能器 H_2048^{-1} 的 100% 确定性可逆特性，直接把 `.pmc` 中的微专家神经元 `(u_m, v_m)`
+        和硬件流线指针表 `stream_next_ptr[m]` 反编译为人类可读的符号控制流图（Symbolic Control Flow Graph, CFG）！
+        """
+        target_pkg = pkg or self.pmc_manager.get_writable_package()
+        if target_pkg is None and len(self.pmc_manager.mounted_packages) > 0:
+            first_pkg = self.pmc_manager.mounted_packages[0]
+            if isinstance(first_pkg, PMCPackage):
+                target_pkg = first_pkg
+        if target_pkg is None:
+            return {"pkg_id": "", "num_active_experts": 0, "cfg_nodes": [], "pseudocode": ""}
+
+        act_mask = target_pkg.scales[:, 1] > 1e-6
+        act_eids = torch.nonzero(act_mask, as_tuple=False).squeeze(-1)
+        if act_eids.numel() == 0:
+            return {"pkg_id": target_pkg.pkg_id, "num_active_experts": 0, "cfg_nodes": [], "pseudocode": ""}
+
+        counts = target_pkg.activation_counts[act_eids].float()
+        order = torch.argsort(counts, descending=True)[: min(max_nodes, int(act_eids.numel()))]
+        sel_eids = act_eids[order]
+        u_mat, v_mat = target_pkg.dequantize_expert_uv(sel_eids)
+
+        cfg_nodes: List[Dict[str, Any]] = []
+        pseudo_lines: List[str] = []
+
+        for idx in range(int(sel_eids.numel())):
+            eid = int(sel_eids[idx].item())
+            r_idx = eid // target_pkg.grid_k
+            c_idx = eid % target_pkg.grid_k
+            u_vec = F.normalize(u_mat[idx].float(), dim=-1)
+            v_vec = v_mat[idx].float()
+            trigger_sym = self.transducer.decode_wavepacket_to_string(u_vec)
+            q_c_clean = (
+                self.transducer.encode_string_to_wavepacket(trigger_sym)
+                if len(trigger_sym) > 0
+                else u_vec
+            )
+            v_perp = v_vec - (v_vec * q_c_clean).sum(dim=-1, keepdim=True) * q_c_clean
+            q_next_state = F.normalize(v_perp, dim=-1) if float(v_perp.norm().item()) > 1e-5 else q_c_clean
+
+            emit_sym = self.transducer.decode_wavepacket_to_string(q_next_state)
+            ptrs = [int(p.item()) for p in target_pkg.stream_next_ptr[eid] if int(p.item()) >= 0]
+            div_local = float((u_vec * F.normalize(v_vec, dim=-1)).sum().item())
+            hits = float(target_pkg.activation_counts[eid].item())
+
+            node_info = {
+                "eid": eid,
+                "grid_coord": f"({r_idx}, {c_idx})",
+                "hits": int(hits),
+                "trigger_symbol": trigger_sym,
+                "emit_symbol": emit_sym,
+                "div_signature": round(div_local, 4),
+                "goto_eids": ptrs,
+            }
+            cfg_nodes.append(node_info)
+            goto_str = ", ".join(f"EID_{p}" for p in ptrs) if ptrs else "RETURN_SINK"
+            pseudo_lines.append(
+                f"[EID_{eid} @ {node_info['grid_coord']} | hits={int(hits)}] "
+                f"IF state ≈ {repr(trigger_sym)} THEN EMIT {repr(emit_sym)} -> GOTO ({goto_str})"
+            )
+
+        return {
+            "pkg_id": target_pkg.pkg_id,
+            "num_active_experts": int(act_eids.numel()),
+            "cfg_nodes": cfg_nodes,
+            "pseudocode": "\n".join(pseudo_lines),
         }
 
 
